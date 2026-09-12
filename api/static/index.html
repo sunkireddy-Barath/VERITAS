@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>VERITAS</title>
+<!--
+  Single-file React, no build step.
+
+  Why not a Next.js project? It would need `npm install` (~300 MB of
+  node_modules) and a dev server before you could see anything. This is React
+  18 from a CDN with Babel compiling JSX in the browser: one file, served by
+  FastAPI, zero install. Every component below ports to a Next.js app verbatim
+  when you want SSR and a real build.
+
+  The one hard UI requirement: every factual sentence must be click-traceable to
+  claim -> evidence -> source -> date. That is why the backend returns a
+  structure and this page renders panels rather than a chat bubble.
+-->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.2/babel.min.js"></script>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1d2129; --line:#2a2f3a;
+    --text:#e6e9ef; --dim:#9aa3b2; --accent:#5b9dff;
+    --ok:#3fb950; --warn:#d29922; --bad:#f85149; --stale:#a371f7;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  .wrap{max-width:1180px;margin:0 auto;padding:24px 20px 60px}
+  header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:6px}
+  h1{font-size:22px;margin:0;letter-spacing:.5px}
+  .tag{color:var(--dim);font-size:13px}
+  .status{margin-left:auto;font-size:12px;color:var(--dim)}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+  .askbar{display:flex;gap:10px;margin:18px 0 10px}
+  input[type=text]{flex:1;background:var(--panel);border:1px solid var(--line);
+    color:var(--text);padding:13px 15px;border-radius:9px;font-size:15px;outline:none}
+  input[type=text]:focus{border-color:var(--accent)}
+  button{background:var(--accent);color:#06101f;border:0;padding:13px 20px;
+    border-radius:9px;font-weight:600;cursor:pointer;font-size:14px}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  button.ghost{background:var(--panel);color:var(--text);border:1px solid var(--line)}
+  button.rec{background:var(--bad);color:#fff}
+  .examples{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px}
+  .chip{background:var(--panel);border:1px solid var(--line);color:var(--dim);
+    padding:6px 11px;border-radius:20px;font-size:12px;cursor:pointer}
+  .chip:hover{border-color:var(--accent);color:var(--text)}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:11px;
+    padding:16px 18px;margin-bottom:14px}
+  .panel h2{font-size:11px;text-transform:uppercase;letter-spacing:1.3px;
+    color:var(--dim);margin:0 0 11px}
+  .answer{font-size:16px;line-height:1.65}
+  .badge{display:inline-block;padding:2px 9px;border-radius:5px;font-size:11px;
+    font-weight:700;letter-spacing:.4px}
+  .SUPPORTED{background:rgba(63,185,80,.16);color:var(--ok)}
+  .REFUTED,.INSUFFICIENT{background:rgba(248,81,73,.16);color:var(--bad)}
+  .CONFLICTED{background:rgba(210,153,34,.16);color:var(--warn)}
+  .TEMPORAL_MISMATCH{background:rgba(163,113,247,.16);color:var(--stale)}
+  .claim{border-left:3px solid var(--line);padding:9px 0 9px 13px;margin-bottom:9px}
+  .claim.SUPPORTED{border-color:var(--ok)}
+  .claim.CONFLICTED{border-color:var(--warn)}
+  .claim.TEMPORAL_MISMATCH{border-color:var(--stale)}
+  .claim.REFUTED,.claim.INSUFFICIENT{border-color:var(--bad)}
+  .cite{color:var(--accent);cursor:pointer;font-size:12px;margin-left:5px}
+  .note{color:var(--dim);font-size:12.5px;margin-top:4px}
+  .tl{display:flex;gap:12px;padding:8px 0;border-bottom:1px solid var(--line)}
+  .tl:last-child{border-bottom:0}
+  .tl .when{color:var(--dim);font-size:12px;min-width:190px;font-variant-numeric:tabular-nums}
+  .tl.cur{background:rgba(91,157,255,.07);margin:0 -8px;padding:8px;border-radius:6px}
+  .src{display:flex;gap:10px;padding:7px 0;font-size:13px;align-items:baseline}
+  .tier{font-size:10px;padding:1px 7px;border-radius:4px;background:var(--panel2);color:var(--dim)}
+  .tier1{color:var(--ok)} .tier2{color:var(--accent)} .tier4{color:var(--bad)}
+  .trace{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;
+    color:var(--dim);white-space:pre-wrap;max-height:190px;overflow:auto}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:840px){.grid{grid-template-columns:1fr}}
+  .metric{display:flex;justify-content:space-between;padding:5px 0;font-size:13px}
+  .metric span:last-child{color:var(--dim);font-variant-numeric:tabular-nums}
+  .empty{color:var(--dim);font-style:italic}
+  a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useRef} = React;
+// Same-origin when served by FastAPI; window.VERITAS_API when deployed to a
+// static host with the backend elsewhere. One file, both deployments.
+const API = (typeof window !== "undefined" && window.VERITAS_API) || "";
+
+const EXAMPLES = [
+  "Who is the current CEO of Apple Inc.?",
+  "Who was the CEO of Microsoft in 2020?",
+  "How did the CEO of Twitter change over time?",
+  "What is Nvidia's revenue?",
+];
+
+function Badge({v}){ return <span className={"badge "+v}>{(v||"").replace("_"," ")}</span>; }
+
+function Health(){
+  const [h,setH]=useState(null);
+  useEffect(()=>{
+    const f=()=>fetch(API+"/health").then(r=>r.json()).then(setH).catch(()=>setH({ready:false}));
+    f(); const t=setInterval(f,5000); return ()=>clearInterval(t);
+  },[]);
+  if(!h) return <div className="status">connecting…</div>;
+  const c = h.ready?"var(--ok)":(h.error?"var(--bad)":"var(--warn)");
+  return <div className="status">
+    <span className="dot" style={{background:c}}></span>
+    {h.ready?`ready · ${h.device} · ${h.checkpoint}`:(h.error?"error":"loading model…")}
+  </div>;
+}
+
+function Voice({onText,disabled}){
+  const [rec,setRec]=useState(false);
+  const ref=useRef(null);
+  const SR = window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!SR) return null;
+  const toggle=()=>{
+    if(rec){ ref.current&&ref.current.stop(); setRec(false); return; }
+    const r=new SR();
+    r.lang="en-US"; r.interimResults=true; r.continuous=false;
+    // Interim results stream into the box so the user sees it working;
+    // the final transcript is what gets submitted.
+    r.onresult=e=>{
+      let t=""; for(let i=0;i<e.results.length;i++) t+=e.results[i][0].transcript;
+      onText(t, e.results[e.results.length-1].isFinal);
+    };
+    r.onend=()=>setRec(false);
+    r.onerror=()=>setRec(false);
+    ref.current=r; r.start(); setRec(true);
+  };
+  return <button className={rec?"rec":"ghost"} onClick={toggle} disabled={disabled}
+    title="Speak your question">{rec?"◼ stop":"🎤 speak"}</button>;
+}
+
+function Speak({text}){
+  const [on,setOn]=useState(false);
+  if(!window.speechSynthesis) return null;
+  const go=()=>{
+    if(on){ speechSynthesis.cancel(); setOn(false); return; }
+    const u=new SpeechSynthesisUtterance(text);
+    u.rate=1.02; u.onend=()=>setOn(false);
+    speechSynthesis.speak(u); setOn(true);
+  };
+  return <button className="ghost" style={{padding:"6px 12px",fontSize:12}} onClick={go}>
+    {on?"◼ stop":"🔊 read aloud"}</button>;
+}
+
+function App(){
+  const [q,setQ]=useState("");
+  const [busy,setBusy]=useState(false);
+  const [ans,setAns]=useState(null);
+  const [trace,setTrace]=useState([]);
+  const [err,setErr]=useState(null);
+  const [stats,setStats]=useState(null);
+
+  useEffect(()=>{fetch(API+"/stats").then(r=>r.json()).then(setStats).catch(()=>{})},[ans]);
+
+  const ask=async(question)=>{
+    const text=(question||q).trim();
+    if(!text||busy) return;
+    setBusy(true); setAns(null); setTrace([]); setErr(null);
+    try{
+      const res=await fetch(API+"/ask/stream",{method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({question:text,history:[],mode:"extractive"})});
+      if(!res.ok) throw new Error("HTTP "+res.status);
+      const reader=res.body.getReader(); const dec=new TextDecoder();
+      let buf="";
+      for(;;){
+        const {done,value}=await reader.read(); if(done) break;
+        buf+=dec.decode(value,{stream:true});
+        const parts=buf.split("\n\n"); buf=parts.pop();
+        for(const p of parts){
+          const ev=(p.match(/^event: (.*)$/m)||[])[1];
+          const dm=(p.match(/^data: (.*)$/m)||[])[1];
+          if(!ev||!dm) continue;
+          const data=JSON.parse(dm);
+          if(ev==="trace") setTrace(t=>[...t,data.line]);
+          else if(ev==="answer") setAns(data);
+          else if(ev==="error") setErr(data.message);
+        }
+      }
+    }catch(e){ setErr(String(e)); }
+    setBusy(false);
+  };
+
+  return <div className="wrap">
+    <header>
+      <h1>VERITAS</h1>
+      <span className="tag">Don't just retrieve the past. Reconstruct what is true now.</span>
+      <Health/>
+    </header>
+
+    <div className="askbar">
+      <input type="text" value={q} placeholder="Ask about an entity — its current state, its history, or what changed…"
+        onChange={e=>setQ(e.target.value)} onKeyDown={e=>e.key==="Enter"&&ask()}/>
+      <Voice disabled={busy} onText={(t,final)=>{setQ(t); if(final) ask(t);}}/>
+      <button onClick={()=>ask()} disabled={busy}>{busy?"investigating…":"Ask"}</button>
+    </div>
+
+    <div className="examples">
+      {EXAMPLES.map(e=><span key={e} className="chip" onClick={()=>{setQ(e);ask(e);}}>{e}</span>)}
+    </div>
+
+    {err && <div className="panel" style={{borderColor:"var(--bad)"}}>
+      <h2>Error</h2><div>{err}</div></div>}
+
+    {trace.length>0 && <div className="panel">
+      <h2>Investigation trace</h2>
+      <div className="trace">{trace.join("\n")}</div>
+    </div>}
+
+    {ans && <>
+      <div className="panel">
+        <h2>Answer</h2>
+        <div className="answer">{ans.answer||<span className="empty">No answer could be established.</span>}</div>
+        <div style={{marginTop:12,display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+          <Badge v={ans.abstained?"INSUFFICIENT":(ans.support_level||"").replace(/ /g,"_")}/>
+          <span className="note">{ans.support_level}</span>
+          <Speak text={ans.answer}/>
+        </div>
+      </div>
+
+      {ans.current_status && <div className="panel">
+        <h2>Current status</h2><div>{ans.current_status.replace(/\*\*/g,"")}</div></div>}
+
+      {ans.claims && ans.claims.length>0 && <div className="panel">
+        <h2>Evidence — claim by claim</h2>
+        {ans.claims.map((c,i)=>
+          <div key={i} className={"claim "+c.verdict}>
+            <Badge v={c.verdict}/> <span style={{marginLeft:6}}>{c.text}</span>
+            {(c.citations||[]).map(m=><span key={m} className="cite">{m}</span>)}
+            {c.note && <div className="note">{c.note}</div>}
+            <div className="note">entailment {c.entailment} · {c.independent_sources} independent source(s)</div>
+          </div>)}
+      </div>}
+
+      <div className="grid">
+        {ans.timeline && ans.timeline.length>0 && <div className="panel">
+          <h2>Historical context</h2>
+          {ans.timeline.map((t,i)=>
+            <div key={i} className={"tl "+(t.is_current?"cur":"")}>
+              <span className="when">{t.valid_from} → {t.valid_to}</span>
+              <span><b>{t.value}</b> <span className="note">({t.source}, rec. {t.recorded_at})</span></span>
+            </div>)}
+        </div>}
+
+        <div className="panel">
+          <h2>Confidence &amp; freshness</h2>
+          <div className="metric"><span>Support level</span><span>{ans.support_level}</span></div>
+          <div className="metric"><span>Evidence score</span><span>{(ans.evidence_score||0).toFixed(2)}</span></div>
+          <div className="metric"><span>Claim coverage</span><span>{((ans.coverage||0)*100).toFixed(0)}%</span></div>
+          <div className="metric"><span>Last verified</span><span>{ans.last_verified||"unknown"}</span></div>
+          <div className="metric"><span>Retrieval rounds</span><span>{ans.iterations}</span></div>
+          <div className="metric"><span>Elapsed</span><span>{ans.elapsed_seconds}s</span></div>
+          <div className="note" style={{marginTop:8}}>
+            Evidence-calibrated support, not a probability of truth.
+          </div>
+        </div>
+      </div>
+
+      {ans.changes && ans.changes.length>0 && <div className="panel">
+        <h2>Changes detected</h2>
+        {ans.changes.map((c,i)=><div key={i} style={{padding:"4px 0"}}>• {c}</div>)}</div>}
+
+      <div className="panel">
+        <h2>Conflicts</h2>
+        {ans.conflicts && ans.conflicts.length>0
+          ? ans.conflicts.map((c,i)=><div key={i} style={{padding:"4px 0"}}>⚠ {c}</div>)
+          : <span className="empty">No disagreement detected between credible sources.</span>}
+      </div>
+
+      <div className="panel">
+        <h2>Unknown</h2>
+        {ans.unknown && ans.unknown.length>0
+          ? ans.unknown.map((u,i)=><div key={i} style={{padding:"3px 0"}}>• {u}</div>)
+          : <span className="empty">Nothing material is outstanding.</span>}
+      </div>
+
+      {ans.citations && ans.citations.length>0 && <div className="panel">
+        <h2>Sources</h2>
+        {ans.citations.map((c,i)=>
+          <div key={i} className="src">
+            <span className="cite">{c.marker}</span>
+            <span className={"tier tier"+c.tier}>tier {c.tier}</span>
+            <span style={{flex:1}}>
+              <b>{c.source}</b> <span className="note">· {c.date||"undated"}</span>
+              <div className="note">{c.quote}</div>
+            </span>
+          </div>)}
+      </div>}
+    </>}
+
+    {stats && <div className="panel">
+      <h2>Live knowledge base</h2>
+      <div className="grid">
+        <div>
+          <div className="metric"><span>Chunks indexed</span><span>{stats.corpus_chunks}</span></div>
+          <div className="metric"><span>Entities tracked</span><span>{stats.entity_count}</span></div>
+          <div className="metric"><span>Fact versions</span><span>{stats.fact_versions}</span></div>
+          <div className="metric"><span>State changes recorded</span><span>{stats.state_changes}</span></div>
+        </div>
+        <div>
+          <div className="metric"><span>Evidence graph nodes</span><span>{(stats.graph||{}).nodes}</span></div>
+          <div className="metric"><span>Evidence graph edges</span><span>{(stats.graph||{}).edges}</span></div>
+          <div className="note" style={{marginTop:6}}>
+            Sources: {(stats.sources||[]).slice(0,6).join(", ")}
+            {(stats.sources||[]).length>6?` +${stats.sources.length-6} more`:""}
+          </div>
+        </div>
+      </div>
+    </div>}
+  </div>;
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
