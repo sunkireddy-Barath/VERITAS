@@ -1,0 +1,288 @@
+"""TemporalEvidenceBench: the benchmark (spec section 27).
+
+Why build one rather than use an existing QA set
+------------------------------------------------
+Standard QA benchmarks (NQ, HotpotQA, TriviaQA) assume a *static* corpus with
+one correct answer. They cannot express the questions this system exists to
+answer, because they have no notion of a fact having been true and then not:
+
+  * there is no way to state "Person A was correct in 2024, wrong now",
+  * there is no gold label for "the sources disagree and you should say so",
+  * there is no gold label for "abstain: the evidence is not there",
+  * a system that quotes a stale source scores *identically* to one that
+    quotes the current one, as long as the string matches.
+
+TemporalEvidenceBench adds those labels. Each item carries a document set with
+explicit dates, source tiers and validity intervals, plus the expected temporal
+state and the expected *behaviour* (answer / surface conflict / abstain).
+
+Eight categories, each targeting one failure mode
+-------------------------------------------------
+  CURRENT              latest state; distractors are earlier valid states
+  HISTORICAL           as-of-then state; the current state is the distractor
+  CHANGE               must produce both endpoints and the effective date
+  CONFLICT             two same-period sources disagree -> must surface it
+  MULTI_HOP            needs two chained retrievals
+  INSUFFICIENT         no document answers it -> must abstain
+  OUTDATED_SOURCE      only stale evidence exists -> must answer with a stale
+                       qualifier, not silently as current
+  CROSS_SOURCE         corroboration across tiers, including a syndicated copy
+                       that must NOT count as independent
+
+The eighth is the one worth arguing about: a system that counts three reprints
+of one wire story as three-source corroboration scores *well* on every other
+benchmark and is exactly the behaviour that produces confident falsehoods.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence
+
+
+class Category:
+    CURRENT = "CURRENT"
+    HISTORICAL = "HISTORICAL"
+    CHANGE = "CHANGE"
+    CONFLICT = "CONFLICT"
+    MULTI_HOP = "MULTI_HOP"
+    INSUFFICIENT = "INSUFFICIENT"
+    OUTDATED_SOURCE = "OUTDATED_SOURCE"
+    CROSS_SOURCE = "CROSS_SOURCE"
+    ALL = ("CURRENT", "HISTORICAL", "CHANGE", "CONFLICT", "MULTI_HOP",
+           "INSUFFICIENT", "OUTDATED_SOURCE", "CROSS_SOURCE")
+
+
+@dataclass
+class BenchDoc:
+    doc_id: str
+    text: str
+    source: str
+    date: str
+    tier: int = 3
+    valid_from: Optional[str] = None
+    valid_to: Optional[str] = None
+    entity: str = ""
+    derived_from: Optional[str] = None   # syndication: not an independent source
+    relevance: float = 0.0               # graded relevance for nDCG
+
+
+@dataclass
+class BenchItem:
+    qid: str
+    question: str
+    category: str
+    entity: str
+    attribute: str
+    expected_answer: List[str] = field(default_factory=list)
+    expected_outdated: List[str] = field(default_factory=list)
+    gold_docs: List[str] = field(default_factory=list)
+    docs: List[BenchDoc] = field(default_factory=list)
+    should_abstain: bool = False
+    has_conflict: bool = False
+    as_of: Optional[str] = None
+    notes: str = ""
+
+    @property
+    def relevance_map(self) -> Dict[str, float]:
+        return {d.doc_id: d.relevance for d in self.docs if d.relevance > 0}
+
+
+class Benchmark:
+    def __init__(self, items: Optional[List[BenchItem]] = None) -> None:
+        self.items: List[BenchItem] = items or []
+
+    def add(self, item: BenchItem) -> None:
+        self.items.append(item)
+
+    def by_category(self, category: str) -> List[BenchItem]:
+        return [i for i in self.items if i.category == category]
+
+    def all_docs(self) -> Dict[str, BenchDoc]:
+        return {d.doc_id: d for item in self.items for d in item.docs}
+
+    def save(self, path: str | Path) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(
+            json.dumps([asdict(i) for i in self.items], indent=1), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: str | Path) -> "Benchmark":
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        items = []
+        for r in raw:
+            docs = [BenchDoc(**d) for d in r.pop("docs", [])]
+            items.append(BenchItem(docs=docs, **r))
+        return cls(items)
+
+    def stats(self) -> Dict[str, int]:
+        out = {c: len(self.by_category(c)) for c in Category.ALL}
+        out["total"] = len(self.items)
+        out["documents"] = len(self.all_docs())
+        return out
+
+
+# --------------------------------------------------------------- seed data
+def build_seed_benchmark() -> Benchmark:
+    """A small hand-written seed set covering all eight categories.
+
+    Hand-written, not LLM-generated: a benchmark generated by a model inherits
+    that model's errors and cannot be used to measure a system that uses the
+    same model. Synthetic expansion is fine for *scale* once the hand-written
+    items pin down the definitions -- see `expand_synthetic`.
+    """
+    b = Benchmark()
+
+    # --- CURRENT: three successive CEOs; the 2026 one is correct -----------
+    ceo_docs = [
+        BenchDoc("acme_2024_ar", "Acme Industries annual report 2024. The chief executive is "
+                 "Dana Whitfield, who was appointed in January 2024.", "ir.acme.com",
+                 "2024-03-01", 1, "2024-01-01", "2025-06-30", "Acme Industries", relevance=1.0),
+        BenchDoc("acme_2025_pr", "Acme Industries announced that Priya Raman becomes chief "
+                 "executive effective July 2025, succeeding Dana Whitfield.", "ir.acme.com",
+                 "2025-06-15", 1, "2025-07-01", "2026-01-31", "Acme Industries", relevance=1.0),
+        BenchDoc("acme_2026_8k", "Acme Industries filing: Marcus Lund was appointed chief "
+                 "executive effective February 2026.", "sec.gov", "2026-02-02", 1,
+                 "2026-02-01", None, "Acme Industries", relevance=3.0),
+        BenchDoc("acme_blog", "A look back at Acme: Dana Whitfield's tenure as CEO reshaped "
+                 "the company.", "medium.com", "2026-04-01", 4, "2024-01-01", "2025-06-30",
+                 "Acme Industries", relevance=0.0),
+    ]
+    b.add(BenchItem(
+        "q_current_ceo", "Who is the current CEO of Acme Industries?", Category.CURRENT,
+        "Acme Industries", "ceo", ["Marcus Lund"], ["Dana Whitfield", "Priya Raman"],
+        ["acme_2026_8k"], ceo_docs,
+        notes="Fails if the system quotes Whitfield or Raman as current.",
+    ))
+    b.add(BenchItem(
+        "q_hist_ceo", "Who was the CEO of Acme Industries in 2024?", Category.HISTORICAL,
+        "Acme Industries", "ceo", ["Dana Whitfield"], ["Marcus Lund"],
+        ["acme_2024_ar"], ceo_docs, as_of="2024-06-01",
+        notes="Inverse of the above: the current answer is now the distractor.",
+    ))
+    b.add(BenchItem(
+        "q_change_ceo", "How did the CEO of Acme Industries change over time?", Category.CHANGE,
+        "Acme Industries", "ceo", ["Dana Whitfield", "Priya Raman", "Marcus Lund"], [],
+        ["acme_2024_ar", "acme_2025_pr", "acme_2026_8k"], ceo_docs,
+        notes="Must produce all three states with effective dates.",
+    ))
+
+    # --- CONFLICT: same period, two credible sources, different numbers ----
+    conflict_docs = [
+        BenchDoc("nova_pr", "Nova Logistics said it opened 15 new offices in India during 2026.",
+                 "ir.novalogistics.com", "2026-08-01", 1, "2026-01-01", "2026-12-31",
+                 "Nova Logistics", relevance=3.0),
+        BenchDoc("nova_reuters", "Nova Logistics opened 12 offices in India in 2026, according "
+                 "to filings reviewed by Reuters.", "reuters.com", "2026-08-14", 2,
+                 "2026-01-01", "2026-12-31", "Nova Logistics", relevance=3.0),
+    ]
+    b.add(BenchItem(
+        "q_conflict_offices", "How many offices did Nova Logistics open in India in 2026?",
+        Category.CONFLICT, "Nova Logistics", "offices", [], [], ["nova_pr", "nova_reuters"],
+        conflict_docs, has_conflict=True,
+        notes="Must report 15 vs 12 as unresolved; silently picking either is a failure.",
+    ))
+
+    # --- INSUFFICIENT: nothing in the corpus answers it --------------------
+    b.add(BenchItem(
+        "q_insufficient", "What is Nova Logistics' 2027 revenue guidance?",
+        Category.INSUFFICIENT, "Nova Logistics", "revenue", [], [], [], conflict_docs,
+        should_abstain=True,
+        notes="Evidence exists about the entity but not about this attribute.",
+    ))
+
+    # --- OUTDATED_SOURCE: only stale evidence exists -----------------------
+    stale_docs = [
+        BenchDoc("port_2023", "The Meridian Port expansion is in the planning phase, with "
+                 "approval expected in 2024.", "gov.example.gov", "2023-05-01", 1,
+                 "2023-05-01", "2024-12-31", "Meridian Port", relevance=2.0),
+    ]
+    b.add(BenchItem(
+        "q_outdated_status", "What is the current status of the Meridian Port expansion?",
+        Category.OUTDATED_SOURCE, "Meridian Port", "status", ["planning"], [],
+        ["port_2023"], stale_docs,
+        notes="Must qualify: valid as of 2023, not confirmed current.",
+    ))
+
+    # --- CROSS_SOURCE: syndication must not count as corroboration ---------
+    synd = [
+        BenchDoc("wire_orig", "Helios Energy has begun construction of its Almeria solar plant, "
+                 "the company said on 3 March 2026.", "reuters.com", "2026-03-03", 2,
+                 "2026-03-03", None, "Helios Energy", relevance=3.0),
+        BenchDoc("reprint_a", "Helios Energy has begun construction of its Almeria solar plant, "
+                 "the company said on 3 March 2026.", "dailyfeed.example.com", "2026-03-04", 3,
+                 "2026-03-03", None, "Helios Energy", derived_from="wire_orig", relevance=0.5),
+        BenchDoc("reprint_b", "Helios Energy has begun construction of its Almeria solar plant, "
+                 "the company said on 3 March 2026.", "newsaggregator.example.net", "2026-03-04",
+                 3, "2026-03-03", None, "Helios Energy", derived_from="wire_orig", relevance=0.5),
+        BenchDoc("helios_filing", "Helios Energy regulatory filing confirms construction start "
+                 "at the Almeria site in March 2026.", "gov.example.gov", "2026-03-10", 1,
+                 "2026-03-03", None, "Helios Energy", relevance=3.0),
+    ]
+    b.add(BenchItem(
+        "q_cross_source", "Has Helios Energy started construction at Almeria?",
+        Category.CROSS_SOURCE, "Helios Energy", "status", ["construction"], [],
+        ["wire_orig", "helios_filing"], synd,
+        notes="Independent sources = 2 (wire + filing), not 4.",
+    ))
+
+    # --- MULTI_HOP ---------------------------------------------------------
+    hop = [
+        BenchDoc("acq_2026", "Orion Systems completed its acquisition of Vertex Analytics in "
+                 "May 2026.", "sec.gov", "2026-05-20", 1, "2026-05-01", None,
+                 "Orion Systems", relevance=3.0),
+        BenchDoc("orion_ceo", "Orion Systems is led by chief executive Ingrid Sollberg, "
+                 "appointed in 2023.", "ir.orionsystems.com", "2026-01-10", 1, "2023-01-01",
+                 None, "Orion Systems", relevance=3.0),
+    ]
+    b.add(BenchItem(
+        "q_multihop", "Who is the CEO of the company that acquired Vertex Analytics?",
+        Category.MULTI_HOP, "Orion Systems", "ceo", ["Ingrid Sollberg"], [],
+        ["acq_2026", "orion_ceo"], hop,
+        notes="Requires hop 1 (acquirer) before hop 2 (its CEO).",
+    ))
+    return b
+
+
+def expand_synthetic(base: Benchmark, n_per_template: int = 5, seed: int = 0) -> Benchmark:
+    """Scale the seed set by templated entity/date substitution.
+
+    Controlled synthesis, not free generation: only names, dates and values
+    vary, so the *labels* stay exactly as hand-written. This buys statistical
+    power without importing a generator model's errors into the gold answers.
+    """
+    import random
+
+    rng = random.Random(seed)
+    firms = ["Cobalt Works", "Vireo Health", "Northwind Rail", "Stellar Foods", "Kestrel Bank"]
+    people = ["Alicia Moreau", "Tomas Berg", "Hana Suzuki", "Emeka Obi", "Lena Petrov",
+              "Raj Malhotra", "Sofia Duarte", "Ben Achterberg"]
+    out = Benchmark(list(base.items))
+    for tmpl in base.items:
+        if tmpl.category not in (Category.CURRENT, Category.HISTORICAL):
+            continue
+        for i in range(n_per_template):
+            firm = rng.choice(firms)
+            old, new = rng.sample(people, 2)
+            y_old, y_new = rng.choice([(2023, 2025), (2024, 2026), (2022, 2024)])
+            docs = [
+                BenchDoc(f"{firm[:3].lower()}_{y_old}_{i}",
+                         f"{firm} annual report {y_old}. The chief executive is {old}.",
+                         f"ir.{firm.split()[0].lower()}.com", f"{y_old}-03-01", 1,
+                         f"{y_old}-01-01", f"{y_new}-01-01", firm, relevance=1.0),
+                BenchDoc(f"{firm[:3].lower()}_{y_new}_{i}",
+                         f"{firm} filing: {new} was appointed chief executive effective "
+                         f"January {y_new}.", "sec.gov", f"{y_new}-01-15", 1,
+                         f"{y_new}-01-01", None, firm, relevance=3.0),
+            ]
+            if tmpl.category == Category.CURRENT:
+                out.add(BenchItem(
+                    f"{tmpl.qid}_syn{i}_{firm[:3]}", f"Who is the current CEO of {firm}?",
+                    Category.CURRENT, firm, "ceo", [new], [old], [docs[1].doc_id], docs))
+            else:
+                out.add(BenchItem(
+                    f"{tmpl.qid}_syn{i}_{firm[:3]}", f"Who was the CEO of {firm} in {y_old}?",
+                    Category.HISTORICAL, firm, "ceo", [old], [new], [docs[0].doc_id], docs,
+                    as_of=f"{y_old}-06-01"))
+    return out
