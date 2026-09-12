@@ -224,6 +224,12 @@ class Veritas:
         if abstain:
             answer_text = f"I cannot establish this from the available evidence. {reason}"
             trace.append(f"ABSTAIN {reason}")
+            # The sufficiency score describes the RETRIEVED SET, which can look
+            # healthy while none of it settles the question. Reporting
+            # "HIGH SUPPORT" beside a refusal is self-contradictory and is
+            # exactly the kind of confident-looking label this system exists to
+            # avoid emitting.
+            label = SupportLevel.INSUFFICIENT
         else:
             answer_text = self.synthesis.compose(
                 plan, verdicts, assessment, self.verifier, lookup, self.cfg.synthesis_mode

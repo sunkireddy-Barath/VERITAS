@@ -29,9 +29,12 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from collections import defaultdict, deque
+
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,7 +42,56 @@ STATIC = Path(__file__).resolve().parent / "static"
 
 app = FastAPI(title="VERITAS", version="0.1",
               description="Verified Evolving Reality & Intelligence Tracking System")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# CORS is pinned by environment. The dev default is same-origin only; a
+# wildcard would let any site drive this API from a victim's browser.
+_ORIGINS = [o.strip() for o in os.environ.get(
+    "VERITAS_ALLOWED_ORIGIN", "http://localhost:8000,http://127.0.0.1:8000"
+).split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_ORIGINS,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-API-Key"],
+)
+
+# ------------------------------------------------------------ auth + limits
+# VERITAS_API_KEY unset => open, for local development. Set it and every write
+# endpoint requires the header. Reads stay public because the answers are
+# meant to be shared; writes mutate the knowledge base.
+_API_KEY = os.environ.get("VERITAS_API_KEY", "")
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def require_api_key(key: Optional[str] = Depends(_api_key_header)) -> None:
+    if not _API_KEY:
+        return
+    # compare_digest: a plain == leaks key length and prefix through timing.
+    import hmac
+
+    if not key or not hmac.compare_digest(key, _API_KEY):
+        raise HTTPException(401, "invalid or missing X-API-Key")
+
+
+# Fixed-window limiter, per client IP. Deliberately in-process and dependency
+# free: it protects a single instance from one abusive client. Behind more than
+# one replica, move the counter to Redis or the platform's edge limiter.
+_RATE_LIMIT = int(os.environ.get("VERITAS_RATE_LIMIT_PER_MIN", "60"))
+_hits: Dict[str, deque] = defaultdict(deque)
+
+
+def rate_limit(request: Request) -> None:
+    if _RATE_LIMIT <= 0:
+        return
+    ip = (request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+          or (request.client.host if request.client else "unknown"))
+    now = time.time()
+    window = _hits[ip]
+    while window and now - window[0] > 60:
+        window.popleft()
+    if len(window) >= _RATE_LIMIT:
+        raise HTTPException(429, f"rate limit {_RATE_LIMIT}/min exceeded")
+    window.append(now)
 
 STATE: Dict[str, Any] = {"ready": False, "error": None}
 
@@ -150,7 +202,7 @@ def stats() -> Dict[str, Any]:
     }
 
 
-@app.post("/ask")
+@app.post("/ask", dependencies=[Depends(rate_limit)])
 def ask(req: AskRequest) -> Dict[str, Any]:
     veritas = _require_ready()
     veritas.cfg.synthesis_mode = req.mode
@@ -161,7 +213,7 @@ def ask(req: AskRequest) -> Dict[str, Any]:
     return out
 
 
-@app.post("/ask/stream")
+@app.post("/ask/stream", dependencies=[Depends(rate_limit)])
 async def ask_stream(req: AskRequest) -> StreamingResponse:
     """SSE: emit progress events, then the final answer.
 
@@ -231,7 +283,7 @@ def provenance(name: str) -> Dict[str, Any]:
     return {"entity": name, "claims": [g.provenance_path(c) for c in claims[:40]]}
 
 
-@app.post("/ingest")
+@app.post("/ingest", dependencies=[Depends(require_api_key), Depends(rate_limit)])
 def ingest(req: IngestRequest) -> Dict[str, Any]:
     """Add a document live. The answer to affected questions changes
     immediately -- no re-index, no retraining."""
@@ -248,7 +300,7 @@ def ingest(req: IngestRequest) -> Dict[str, Any]:
     }
 
 
-@app.post("/refresh")
+@app.post("/refresh", dependencies=[Depends(require_api_key), Depends(rate_limit)])
 def refresh() -> Dict[str, Any]:
     """Re-poll the live feeds now and ingest anything new."""
     _require_ready()

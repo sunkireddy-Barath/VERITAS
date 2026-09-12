@@ -1,0 +1,40 @@
+# Fly.io deployment. `fly launch --no-deploy` then `fly deploy`.
+app = "veritas-api"
+primary_region = "iad"
+
+[build]
+  dockerfile = "docker/Dockerfile.api"
+
+[env]
+  VERITAS_DEVICE = "cpu"        # "cuda" on a GPU machine
+  VERITAS_LOG_LEVEL = "INFO"
+
+[[mounts]]
+  source = "veritas_data"
+  destination = "/app/data"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  # NEVER scale to zero: every cold start reloads the model and re-indexes the
+  # corpus, so the first user after an idle period waits ~25 seconds.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 20
+    hard_limit = 40
+
+[[vm]]
+  memory = "4gb"
+  cpu_kind = "shared"
+  cpus = 2
+
+[checks.health]
+  type = "http"
+  path = "/health"
+  interval = "30s"
+  timeout = "10s"
+  grace_period = "90s"          # must exceed model load time

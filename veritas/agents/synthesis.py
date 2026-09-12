@@ -58,8 +58,24 @@ class SynthesisAgent:
                         f"{v.value}, covering {v.valid_from.date()} to {v.valid_to.date()} "
                         f"(reported {v.recorded_at.date()} by {v.source_id or 'unknown'}). "
                         f"No newer figure has been published.")
-        if plan.temporal and plan.temporal.intent == TemporalIntent.CHANGE and assessment.changes:
-            head = " ".join(assessment.changes[:3])
+        if plan.temporal and plan.temporal.intent == TemporalIntent.CHANGE:
+            if assessment.changes:
+                head = " ".join(assessment.changes[:3])
+            elif len(assessment.historical) >= 2:
+                # A series of non-overlapping periods (annual revenue, say)
+                # records no CHANGED events -- each fiscal year is its own
+                # fact. The progression IS the answer, so render the timeline
+                # rather than falling through to "the latest value", which
+                # answers a different question entirely.
+                series = sorted(assessment.historical, key=lambda v: v.valid_from)
+                pts = [f"{v.valid_from.date()} to {v.valid_to.date()}: {v.value}"
+                       for v in series[-6:]]
+                first, last = series[0], series[-1]
+                head = (f"{plan.entity}'s {plan.attribute} across "
+                        f"{len(series)} recorded periods -- " + "; ".join(pts) + ". "
+                        f"Earliest on record {first.value} "
+                        f"({first.valid_from.date()}); most recent {last.value} "
+                        f"({last.valid_to.date()}).")
         if plan.temporal and plan.temporal.intent in (TemporalIntent.HISTORICAL, TemporalIntent.AS_OF):
             hist = [h for h in assessment.historical
                     if h.valid_from <= plan.temporal.anchor < h.valid_to]
