@@ -1,6 +1,7 @@
 # Model artifacts — large binaries, reproducible from the notebooks
 checkpoints/*.pt
 checkpoints/*.bin
+checkpoints/tokenizer.json
 !checkpoints/.gitkeep
 
 # Data — fetched from real sources, never committed
