@@ -1,0 +1,904 @@
+[
+ {
+  "qid": "q_current_ceo",
+  "question": "Who is the current CEO of Acme Industries?",
+  "category": "CURRENT",
+  "entity": "Acme Industries",
+  "attribute": "ceo",
+  "expected_answer": [
+   "Marcus Lund"
+  ],
+  "expected_outdated": [
+   "Dana Whitfield",
+   "Priya Raman"
+  ],
+  "gold_docs": [
+   "acme_2026_8k"
+  ],
+  "docs": [
+   {
+    "doc_id": "acme_2024_ar",
+    "text": "Acme Industries annual report 2024. The chief executive is Dana Whitfield, who was appointed in January 2024.",
+    "source": "ir.acme.com",
+    "date": "2024-03-01",
+    "tier": 1,
+    "valid_from": "2024-01-01",
+    "valid_to": "2025-06-30",
+    "entity": "Acme Industries",
+    "derived_from": null,
+    "relevance": 1.0
+   },
+   {
+    "doc_id": "acme_2025_pr",
+    "text": "Acme Industries announced that Priya Raman becomes chief executive effective July 2025, succeeding Dana Whitfield.",
+    "source": "ir.acme.com",
+    "date": "2025-06-15",
+    "tier": 1,
+    "valid_from": "2025-07-01",
+    "valid_to": "2026-01-31",
+    "entity": "Acme Industries",
+    "derived_from": null,
+    "relevance": 1.0
+   },
+   {
+    "doc_id": "acme_2026_8k",
+    "text": "Acme Industries filing: Marcus Lund was appointed chief executive effective February 2026.",
+    "source": "sec.gov",
+    "date": "2026-02-02",
+    "tier": 1,
+    "valid_from": "2026-02-01",
+    "valid_to": null,
+    "entity": "Acme Industries",
+    "derived_from": null,
+    "relevance": 3.0
+   },
+   {
+    "doc_id": "acme_blog",
+    "text": "A look back at Acme: Dana Whitfield's tenure as CEO reshaped the company.",
+    "source": "medium.com",
+    "date": "2026-04-01",
+    "tier": 4,
+    "valid_from": "2024-01-01",
+    "valid_to": "2025-06-30",
+    "entity": "Acme Industries",
+    "derived_from": null,
+    "relevance": 0.0
+   }
+  ],
+  "should_abstain": false,
+  "has_conflict": false,
+  "as_of": null,
+  "notes": "Fails if the system quotes Whitfield or Raman as current."
+ },
+ {
+  "qid": "q_hist_ceo",
+  "question": "Who was the CEO of Acme Industries in 2024?",
+  "category": "HISTORICAL",
+  "entity": "Acme Industries",
+  "attribute": "ceo",
+  "expected_answer": [
+   "Dana Whitfield"
+  ],
+  "expected_outdated": [
+   "Marcus Lund"
+  ],
+  "gold_docs": [
+   "acme_2024_ar"
+  ],
+  "docs": [
+   {
+    "doc_id": "acme_2024_ar",
+    "text": "Acme Industries annual report 2024. The chief executive is Dana Whitfield, who was appointed in January 2024.",
+    "source": "ir.acme.com",
+    "date": "2024-03-01",
+    "tier": 1,
+    "valid_from": "2024-01-01",
+    "valid_to": "2025-06-30",
+    "entity": "Acme Industries",
+    "derived_from": null,
+    "relevance": 1.0
+   },
+   {
+    "doc_id": "acme_2025_pr",
+    "text": "Acme Industries announced that Priya Raman becomes chief executive effective July 2025, succeeding Dana Whitfield.",
+    "source": "ir.acme.com",
+    "date": "2025-06-15",
+    "tier": 1,
+    "valid_from": "2025-07-01",
+    "valid_to": "2026-01-31",
+    "entity": "Acme Industries",
+    "derived_from": null,
+    "relevance": 1.0
+   },
+   {
+    "doc_id": "acme_2026_8k",
+    "text": "Acme Industries filing: Marcus Lund was appointed chief executive effective February 2026.",
+    "source": "sec.gov",
+    "date": "2026-02-02",
+    "tier": 1,
+    "valid_from": "2026-02-01",
+    "valid_to": null,
+    "entity": "Acme Industries",
+    "derived_from": null,
+    "relevance": 3.0
+   },
+   {
+    "doc_id": "acme_blog",
+    "text": "A look back at Acme: Dana Whitfield's tenure as CEO reshaped the company.",
+    "source": "medium.com",
+    "date": "2026-04-01",
+    "tier": 4,
+    "valid_from": "2024-01-01",
+    "valid_to": "2025-06-30",
+    "entity": "Acme Industries",
+    "derived_from": null,
+    "relevance": 0.0
+   }
+  ],
+  "should_abstain": false,
+  "has_conflict": false,
+  "as_of": "2024-06-01",
+  "notes": "Inverse of the above: the current answer is now the distractor."
+ },
+ {
+  "qid": "q_change_ceo",
+  "question": "How did the CEO of Acme Industries change over time?",
+  "category": "CHANGE",
+  "entity": "Acme Industries",
+  "attribute": "ceo",
+  "expected_answer": [
+   "Dana Whitfield",
+   "Priya Raman",
+   "Marcus Lund"
+  ],
+  "expected_outdated": [],
+  "gold_docs": [
+   "acme_2024_ar",
+   "acme_2025_pr",
+   "acme_2026_8k"
+  ],
+  "docs": [
+   {
+    "doc_id": "acme_2024_ar",
+    "text": "Acme Industries annual report 2024. The chief executive is Dana Whitfield, who was appointed in January 2024.",
+    "source": "ir.acme.com",
+    "date": "2024-03-01",
+    "tier": 1,
+    "valid_from": "2024-01-01",
+    "valid_to": "2025-06-30",
+    "entity": "Acme Industries",
+    "derived_from": null,
+    "relevance": 1.0
+   },
+   {
+    "doc_id": "acme_2025_pr",
+    "text": "Acme Industries announced that Priya Raman becomes chief executive effective July 2025, succeeding Dana Whitfield.",
+    "source": "ir.acme.com",
+    "date": "2025-06-15",
+    "tier": 1,
+    "valid_from": "2025-07-01",
+    "valid_to": "2026-01-31",
+    "entity": "Acme Industries",
+    "derived_from": null,
+    "relevance": 1.0
+   },
+   {
+    "doc_id": "acme_2026_8k",
+    "text": "Acme Industries filing: Marcus Lund was appointed chief executive effective February 2026.",
+    "source": "sec.gov",
+    "date": "2026-02-02",
+    "tier": 1,
+    "valid_from": "2026-02-01",
+    "valid_to": null,
+    "entity": "Acme Industries",
+    "derived_from": null,
+    "relevance": 3.0
+   },
+   {
+    "doc_id": "acme_blog",
+    "text": "A look back at Acme: Dana Whitfield's tenure as CEO reshaped the company.",
+    "source": "medium.com",
+    "date": "2026-04-01",
+    "tier": 4,
+    "valid_from": "2024-01-01",
+    "valid_to": "2025-06-30",
+    "entity": "Acme Industries",
+    "derived_from": null,
+    "relevance": 0.0
+   }
+  ],
+  "should_abstain": false,
+  "has_conflict": false,
+  "as_of": null,
+  "notes": "Must produce all three states with effective dates."
+ },
+ {
+  "qid": "q_conflict_offices",
+  "question": "How many offices did Nova Logistics open in India in 2026?",
+  "category": "CONFLICT",
+  "entity": "Nova Logistics",
+  "attribute": "offices",
+  "expected_answer": [],
+  "expected_outdated": [],
+  "gold_docs": [
+   "nova_pr",
+   "nova_reuters"
+  ],
+  "docs": [
+   {
+    "doc_id": "nova_pr",
+    "text": "Nova Logistics said it opened 15 new offices in India during 2026.",
+    "source": "ir.novalogistics.com",
+    "date": "2026-08-01",
+    "tier": 1,
+    "valid_from": "2026-01-01",
+    "valid_to": "2026-12-31",
+    "entity": "Nova Logistics",
+    "derived_from": null,
+    "relevance": 3.0
+   },
+   {
+    "doc_id": "nova_reuters",
+    "text": "Nova Logistics opened 12 offices in India in 2026, according to filings reviewed by Reuters.",
+    "source": "reuters.com",
+    "date": "2026-08-14",
+    "tier": 2,
+    "valid_from": "2026-01-01",
+    "valid_to": "2026-12-31",
+    "entity": "Nova Logistics",
+    "derived_from": null,
+    "relevance": 3.0
+   }
+  ],
+  "should_abstain": false,
+  "has_conflict": true,
+  "as_of": null,
+  "notes": "Must report 15 vs 12 as unresolved; silently picking either is a failure."
+ },
+ {
+  "qid": "q_insufficient",
+  "question": "What is Nova Logistics' 2027 revenue guidance?",
+  "category": "INSUFFICIENT",
+  "entity": "Nova Logistics",
+  "attribute": "revenue",
+  "expected_answer": [],
+  "expected_outdated": [],
+  "gold_docs": [],
+  "docs": [
+   {
+    "doc_id": "nova_pr",
+    "text": "Nova Logistics said it opened 15 new offices in India during 2026.",
+    "source": "ir.novalogistics.com",
+    "date": "2026-08-01",
+    "tier": 1,
+    "valid_from": "2026-01-01",
+    "valid_to": "2026-12-31",
+    "entity": "Nova Logistics",
+    "derived_from": null,
+    "relevance": 3.0
+   },
+   {
+    "doc_id": "nova_reuters",
+    "text": "Nova Logistics opened 12 offices in India in 2026, according to filings reviewed by Reuters.",
+    "source": "reuters.com",
+    "date": "2026-08-14",
+    "tier": 2,
+    "valid_from": "2026-01-01",
+    "valid_to": "2026-12-31",
+    "entity": "Nova Logistics",
+    "derived_from": null,
+    "relevance": 3.0
+   }
+  ],
+  "should_abstain": true,
+  "has_conflict": false,
+  "as_of": null,
+  "notes": "Evidence exists about the entity but not about this attribute."
+ },
+ {
+  "qid": "q_outdated_status",
+  "question": "What is the current status of the Meridian Port expansion?",
+  "category": "OUTDATED_SOURCE",
+  "entity": "Meridian Port",
+  "attribute": "status",
+  "expected_answer": [
+   "planning"
+  ],
+  "expected_outdated": [],
+  "gold_docs": [
+   "port_2023"
+  ],
+  "docs": [
+   {
+    "doc_id": "port_2023",
+    "text": "The Meridian Port expansion is in the planning phase, with approval expected in 2024.",
+    "source": "gov.example.gov",
+    "date": "2023-05-01",
+    "tier": 1,
+    "valid_from": "2023-05-01",
+    "valid_to": "2024-12-31",
+    "entity": "Meridian Port",
+    "derived_from": null,
+    "relevance": 2.0
+   }
+  ],
+  "should_abstain": false,
+  "has_conflict": false,
+  "as_of": null,
+  "notes": "Must qualify: valid as of 2023, not confirmed current."
+ },
+ {
+  "qid": "q_cross_source",
+  "question": "Has Helios Energy started construction at Almeria?",
+  "category": "CROSS_SOURCE",
+  "entity": "Helios Energy",
+  "attribute": "status",
+  "expected_answer": [
+   "construction"
+  ],
+  "expected_outdated": [],
+  "gold_docs": [
+   "wire_orig",
+   "helios_filing"
+  ],
+  "docs": [
+   {
+    "doc_id": "wire_orig",
+    "text": "Helios Energy has begun construction of its Almeria solar plant, the company said on 3 March 2026.",
+    "source": "reuters.com",
+    "date": "2026-03-03",
+    "tier": 2,
+    "valid_from": "2026-03-03",
+    "valid_to": null,
+    "entity": "Helios Energy",
+    "derived_from": null,
+    "relevance": 3.0
+   },
+   {
+    "doc_id": "reprint_a",
+    "text": "Helios Energy has begun construction of its Almeria solar plant, the company said on 3 March 2026.",
+    "source": "dailyfeed.example.com",
+    "date": "2026-03-04",
+    "tier": 3,
+    "valid_from": "2026-03-03",
+    "valid_to": null,
+    "entity": "Helios Energy",
+    "derived_from": "wire_orig",
+    "relevance": 0.5
+   },
+   {
+    "doc_id": "reprint_b",
+    "text": "Helios Energy has begun construction of its Almeria solar plant, the company said on 3 March 2026.",
+    "source": "newsaggregator.example.net",
+    "date": "2026-03-04",
+    "tier": 3,
+    "valid_from": "2026-03-03",
+    "valid_to": null,
+    "entity": "Helios Energy",
+    "derived_from": "wire_orig",
+    "relevance": 0.5
+   },
+   {
+    "doc_id": "helios_filing",
+    "text": "Helios Energy regulatory filing confirms construction start at the Almeria site in March 2026.",
+    "source": "gov.example.gov",
+    "date": "2026-03-10",
+    "tier": 1,
+    "valid_from": "2026-03-03",
+    "valid_to": null,
+    "entity": "Helios Energy",
+    "derived_from": null,
+    "relevance": 3.0
+   }
+  ],
+  "should_abstain": false,
+  "has_conflict": false,
+  "as_of": null,
+  "notes": "Independent sources = 2 (wire + filing), not 4."
+ },
+ {
+  "qid": "q_multihop",
+  "question": "Who is the CEO of the company that acquired Vertex Analytics?",
+  "category": "MULTI_HOP",
+  "entity": "Orion Systems",
+  "attribute": "ceo",
+  "expected_answer": [
+   "Ingrid Sollberg"
+  ],
+  "expected_outdated": [],
+  "gold_docs": [
+   "acq_2026",
+   "orion_ceo"
+  ],
+  "docs": [
+   {
+    "doc_id": "acq_2026",
+    "text": "Orion Systems completed its acquisition of Vertex Analytics in May 2026.",
+    "source": "sec.gov",
+    "date": "2026-05-20",
+    "tier": 1,
+    "valid_from": "2026-05-01",
+    "valid_to": null,
+    "entity": "Orion Systems",
+    "derived_from": null,
+    "relevance": 3.0
+   },
+   {
+    "doc_id": "orion_ceo",
+    "text": "Orion Systems is led by chief executive Ingrid Sollberg, appointed in 2023.",
+    "source": "ir.orionsystems.com",
+    "date": "2026-01-10",
+    "tier": 1,
+    "valid_from": "2023-01-01",
+    "valid_to": null,
+    "entity": "Orion Systems",
+    "derived_from": null,
+    "relevance": 3.0
+   }
+  ],
+  "should_abstain": false,
+  "has_conflict": false,
+  "as_of": null,
+  "notes": "Requires hop 1 (acquirer) before hop 2 (its CEO)."
+ },
+ {
+  "qid": "q_current_ceo_syn0_Ste",
+  "question": "Who is the current CEO of Stellar Foods?",
+  "category": "CURRENT",
+  "entity": "Stellar Foods",
+  "attribute": "ceo",
+  "expected_answer": [
+   "Alicia Moreau"
+  ],
+  "expected_outdated": [
+   "Sofia Duarte"
+  ],
+  "gold_docs": [
+   "ste_2026_0"
+  ],
+  "docs": [
+   {
+    "doc_id": "ste_2024_0",
+    "text": "Stellar Foods annual report 2024. The chief executive is Sofia Duarte.",
+    "source": "ir.stellar.com",
+    "date": "2024-03-01",
+    "tier": 1,
+    "valid_from": "2024-01-01",
+    "valid_to": "2026-01-01",
+    "entity": "Stellar Foods",
+    "derived_from": null,
+    "relevance": 1.0
+   },
+   {
+    "doc_id": "ste_2026_0",
+    "text": "Stellar Foods filing: Alicia Moreau was appointed chief executive effective January 2026.",
+    "source": "sec.gov",
+    "date": "2026-01-15",
+    "tier": 1,
+    "valid_from": "2026-01-01",
+    "valid_to": null,
+    "entity": "Stellar Foods",
+    "derived_from": null,
+    "relevance": 3.0
+   }
+  ],
+  "should_abstain": false,
+  "has_conflict": false,
+  "as_of": null,
+  "notes": ""
+ },
+ {
+  "qid": "q_current_ceo_syn1_Kes",
+  "question": "Who is the current CEO of Kestrel Bank?",
+  "category": "CURRENT",
+  "entity": "Kestrel Bank",
+  "attribute": "ceo",
+  "expected_answer": [
+   "Emeka Obi"
+  ],
+  "expected_outdated": [
+   "Ben Achterberg"
+  ],
+  "gold_docs": [
+   "kes_2026_1"
+  ],
+  "docs": [
+   {
+    "doc_id": "kes_2024_1",
+    "text": "Kestrel Bank annual report 2024. The chief executive is Ben Achterberg.",
+    "source": "ir.kestrel.com",
+    "date": "2024-03-01",
+    "tier": 1,
+    "valid_from": "2024-01-01",
+    "valid_to": "2026-01-01",
+    "entity": "Kestrel Bank",
+    "derived_from": null,
+    "relevance": 1.0
+   },
+   {
+    "doc_id": "kes_2026_1",
+    "text": "Kestrel Bank filing: Emeka Obi was appointed chief executive effective January 2026.",
+    "source": "sec.gov",
+    "date": "2026-01-15",
+    "tier": 1,
+    "valid_from": "2026-01-01",
+    "valid_to": null,
+    "entity": "Kestrel Bank",
+    "derived_from": null,
+    "relevance": 3.0
+   }
+  ],
+  "should_abstain": false,
+  "has_conflict": false,
+  "as_of": null,
+  "notes": ""
+ },
+ {
+  "qid": "q_current_ceo_syn2_Ste",
+  "question": "Who is the current CEO of Stellar Foods?",
+  "category": "CURRENT",
+  "entity": "Stellar Foods",
+  "attribute": "ceo",
+  "expected_answer": [
+   "Lena Petrov"
+  ],
+  "expected_outdated": [
+   "Raj Malhotra"
+  ],
+  "gold_docs": [
+   "ste_2025_2"
+  ],
+  "docs": [
+   {
+    "doc_id": "ste_2023_2",
+    "text": "Stellar Foods annual report 2023. The chief executive is Raj Malhotra.",
+    "source": "ir.stellar.com",
+    "date": "2023-03-01",
+    "tier": 1,
+    "valid_from": "2023-01-01",
+    "valid_to": "2025-01-01",
+    "entity": "Stellar Foods",
+    "derived_from": null,
+    "relevance": 1.0
+   },
+   {
+    "doc_id": "ste_2025_2",
+    "text": "Stellar Foods filing: Lena Petrov was appointed chief executive effective January 2025.",
+    "source": "sec.gov",
+    "date": "2025-01-15",
+    "tier": 1,
+    "valid_from": "2025-01-01",
+    "valid_to": null,
+    "entity": "Stellar Foods",
+    "derived_from": null,
+    "relevance": 3.0
+   }
+  ],
+  "should_abstain": false,
+  "has_conflict": false,
+  "as_of": null,
+  "notes": ""
+ },
+ {
+  "qid": "q_current_ceo_syn3_Kes",
+  "question": "Who is the current CEO of Kestrel Bank?",
+  "category": "CURRENT",
+  "entity": "Kestrel Bank",
+  "attribute": "ceo",
+  "expected_answer": [
+   "Ben Achterberg"
+  ],
+  "expected_outdated": [
+   "Hana Suzuki"
+  ],
+  "gold_docs": [
+   "kes_2025_3"
+  ],
+  "docs": [
+   {
+    "doc_id": "kes_2023_3",
+    "text": "Kestrel Bank annual report 2023. The chief executive is Hana Suzuki.",
+    "source": "ir.kestrel.com",
+    "date": "2023-03-01",
+    "tier": 1,
+    "valid_from": "2023-01-01",
+    "valid_to": "2025-01-01",
+    "entity": "Kestrel Bank",
+    "derived_from": null,
+    "relevance": 1.0
+   },
+   {
+    "doc_id": "kes_2025_3",
+    "text": "Kestrel Bank filing: Ben Achterberg was appointed chief executive effective January 2025.",
+    "source": "sec.gov",
+    "date": "2025-01-15",
+    "tier": 1,
+    "valid_from": "2025-01-01",
+    "valid_to": null,
+    "entity": "Kestrel Bank",
+    "derived_from": null,
+    "relevance": 3.0
+   }
+  ],
+  "should_abstain": false,
+  "has_conflict": false,
+  "as_of": null,
+  "notes": ""
+ },
+ {
+  "qid": "q_current_ceo_syn4_Cob",
+  "question": "Who is the current CEO of Cobalt Works?",
+  "category": "CURRENT",
+  "entity": "Cobalt Works",
+  "attribute": "ceo",
+  "expected_answer": [
+   "Ben Achterberg"
+  ],
+  "expected_outdated": [
+   "Lena Petrov"
+  ],
+  "gold_docs": [
+   "cob_2024_4"
+  ],
+  "docs": [
+   {
+    "doc_id": "cob_2022_4",
+    "text": "Cobalt Works annual report 2022. The chief executive is Lena Petrov.",
+    "source": "ir.cobalt.com",
+    "date": "2022-03-01",
+    "tier": 1,
+    "valid_from": "2022-01-01",
+    "valid_to": "2024-01-01",
+    "entity": "Cobalt Works",
+    "derived_from": null,
+    "relevance": 1.0
+   },
+   {
+    "doc_id": "cob_2024_4",
+    "text": "Cobalt Works filing: Ben Achterberg was appointed chief executive effective January 2024.",
+    "source": "sec.gov",
+    "date": "2024-01-15",
+    "tier": 1,
+    "valid_from": "2024-01-01",
+    "valid_to": null,
+    "entity": "Cobalt Works",
+    "derived_from": null,
+    "relevance": 3.0
+   }
+  ],
+  "should_abstain": false,
+  "has_conflict": false,
+  "as_of": null,
+  "notes": ""
+ },
+ {
+  "qid": "q_hist_ceo_syn0_Kes",
+  "question": "Who was the CEO of Kestrel Bank in 2023?",
+  "category": "HISTORICAL",
+  "entity": "Kestrel Bank",
+  "attribute": "ceo",
+  "expected_answer": [
+   "Hana Suzuki"
+  ],
+  "expected_outdated": [
+   "Ben Achterberg"
+  ],
+  "gold_docs": [
+   "kes_2023_0"
+  ],
+  "docs": [
+   {
+    "doc_id": "kes_2023_0",
+    "text": "Kestrel Bank annual report 2023. The chief executive is Hana Suzuki.",
+    "source": "ir.kestrel.com",
+    "date": "2023-03-01",
+    "tier": 1,
+    "valid_from": "2023-01-01",
+    "valid_to": "2025-01-01",
+    "entity": "Kestrel Bank",
+    "derived_from": null,
+    "relevance": 1.0
+   },
+   {
+    "doc_id": "kes_2025_0",
+    "text": "Kestrel Bank filing: Ben Achterberg was appointed chief executive effective January 2025.",
+    "source": "sec.gov",
+    "date": "2025-01-15",
+    "tier": 1,
+    "valid_from": "2025-01-01",
+    "valid_to": null,
+    "entity": "Kestrel Bank",
+    "derived_from": null,
+    "relevance": 3.0
+   }
+  ],
+  "should_abstain": false,
+  "has_conflict": false,
+  "as_of": "2023-06-01",
+  "notes": ""
+ },
+ {
+  "qid": "q_hist_ceo_syn1_Cob",
+  "question": "Who was the CEO of Cobalt Works in 2022?",
+  "category": "HISTORICAL",
+  "entity": "Cobalt Works",
+  "attribute": "ceo",
+  "expected_answer": [
+   "Raj Malhotra"
+  ],
+  "expected_outdated": [
+   "Emeka Obi"
+  ],
+  "gold_docs": [
+   "cob_2022_1"
+  ],
+  "docs": [
+   {
+    "doc_id": "cob_2022_1",
+    "text": "Cobalt Works annual report 2022. The chief executive is Raj Malhotra.",
+    "source": "ir.cobalt.com",
+    "date": "2022-03-01",
+    "tier": 1,
+    "valid_from": "2022-01-01",
+    "valid_to": "2024-01-01",
+    "entity": "Cobalt Works",
+    "derived_from": null,
+    "relevance": 1.0
+   },
+   {
+    "doc_id": "cob_2024_1",
+    "text": "Cobalt Works filing: Emeka Obi was appointed chief executive effective January 2024.",
+    "source": "sec.gov",
+    "date": "2024-01-15",
+    "tier": 1,
+    "valid_from": "2024-01-01",
+    "valid_to": null,
+    "entity": "Cobalt Works",
+    "derived_from": null,
+    "relevance": 3.0
+   }
+  ],
+  "should_abstain": false,
+  "has_conflict": false,
+  "as_of": "2022-06-01",
+  "notes": ""
+ },
+ {
+  "qid": "q_hist_ceo_syn2_Cob",
+  "question": "Who was the CEO of Cobalt Works in 2024?",
+  "category": "HISTORICAL",
+  "entity": "Cobalt Works",
+  "attribute": "ceo",
+  "expected_answer": [
+   "Raj Malhotra"
+  ],
+  "expected_outdated": [
+   "Emeka Obi"
+  ],
+  "gold_docs": [
+   "cob_2024_2"
+  ],
+  "docs": [
+   {
+    "doc_id": "cob_2024_2",
+    "text": "Cobalt Works annual report 2024. The chief executive is Raj Malhotra.",
+    "source": "ir.cobalt.com",
+    "date": "2024-03-01",
+    "tier": 1,
+    "valid_from": "2024-01-01",
+    "valid_to": "2026-01-01",
+    "entity": "Cobalt Works",
+    "derived_from": null,
+    "relevance": 1.0
+   },
+   {
+    "doc_id": "cob_2026_2",
+    "text": "Cobalt Works filing: Emeka Obi was appointed chief executive effective January 2026.",
+    "source": "sec.gov",
+    "date": "2026-01-15",
+    "tier": 1,
+    "valid_from": "2026-01-01",
+    "valid_to": null,
+    "entity": "Cobalt Works",
+    "derived_from": null,
+    "relevance": 3.0
+   }
+  ],
+  "should_abstain": false,
+  "has_conflict": false,
+  "as_of": "2024-06-01",
+  "notes": ""
+ },
+ {
+  "qid": "q_hist_ceo_syn3_Kes",
+  "question": "Who was the CEO of Kestrel Bank in 2024?",
+  "category": "HISTORICAL",
+  "entity": "Kestrel Bank",
+  "attribute": "ceo",
+  "expected_answer": [
+   "Emeka Obi"
+  ],
+  "expected_outdated": [
+   "Lena Petrov"
+  ],
+  "gold_docs": [
+   "kes_2024_3"
+  ],
+  "docs": [
+   {
+    "doc_id": "kes_2024_3",
+    "text": "Kestrel Bank annual report 2024. The chief executive is Emeka Obi.",
+    "source": "ir.kestrel.com",
+    "date": "2024-03-01",
+    "tier": 1,
+    "valid_from": "2024-01-01",
+    "valid_to": "2026-01-01",
+    "entity": "Kestrel Bank",
+    "derived_from": null,
+    "relevance": 1.0
+   },
+   {
+    "doc_id": "kes_2026_3",
+    "text": "Kestrel Bank filing: Lena Petrov was appointed chief executive effective January 2026.",
+    "source": "sec.gov",
+    "date": "2026-01-15",
+    "tier": 1,
+    "valid_from": "2026-01-01",
+    "valid_to": null,
+    "entity": "Kestrel Bank",
+    "derived_from": null,
+    "relevance": 3.0
+   }
+  ],
+  "should_abstain": false,
+  "has_conflict": false,
+  "as_of": "2024-06-01",
+  "notes": ""
+ },
+ {
+  "qid": "q_hist_ceo_syn4_Ste",
+  "question": "Who was the CEO of Stellar Foods in 2022?",
+  "category": "HISTORICAL",
+  "entity": "Stellar Foods",
+  "attribute": "ceo",
+  "expected_answer": [
+   "Lena Petrov"
+  ],
+  "expected_outdated": [
+   "Alicia Moreau"
+  ],
+  "gold_docs": [
+   "ste_2022_4"
+  ],
+  "docs": [
+   {
+    "doc_id": "ste_2022_4",
+    "text": "Stellar Foods annual report 2022. The chief executive is Lena Petrov.",
+    "source": "ir.stellar.com",
+    "date": "2022-03-01",
+    "tier": 1,
+    "valid_from": "2022-01-01",
+    "valid_to": "2024-01-01",
+    "entity": "Stellar Foods",
+    "derived_from": null,
+    "relevance": 1.0
+   },
+   {
+    "doc_id": "ste_2024_4",
+    "text": "Stellar Foods filing: Alicia Moreau was appointed chief executive effective January 2024.",
+    "source": "sec.gov",
+    "date": "2024-01-15",
+    "tier": 1,
+    "valid_from": "2024-01-01",
+    "valid_to": null,
+    "entity": "Stellar Foods",
+    "derived_from": null,
+    "relevance": 3.0
+   }
+  ],
+  "should_abstain": false,
+  "has_conflict": false,
+  "as_of": "2022-06-01",
+  "notes": ""
+ }
+]
