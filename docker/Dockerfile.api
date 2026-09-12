@@ -1,0 +1,40 @@
+# VERITAS API — CPU image. For GPU, swap the base for
+# nvidia/cuda:12.4-runtime-ubuntu22.04 and install the cu124 torch wheel.
+FROM python:3.12-slim AS base
+
+# Build deps only in the builder layer, so the runtime image stays small.
+FROM base AS builder
+WORKDIR /build
+RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt .
+# CPU torch wheel: ~200MB instead of ~2.5GB with bundled CUDA.
+RUN pip install --no-cache-dir --prefix=/install \
+      --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+
+FROM base AS runtime
+WORKDIR /app
+COPY --from=builder /install /usr/local
+COPY veritas/ ./veritas/
+COPY api/ ./api/
+COPY scripts/ ./scripts/
+COPY run_veritas.py ./
+
+# Non-root: the container fetches from the public internet, so it should not
+# run as root.
+RUN useradd -m -u 10001 veritas \
+    && mkdir -p /app/checkpoints /app/data/real /app/data/raw \
+    && chown -R veritas:veritas /app
+USER veritas
+
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+EXPOSE 8000
+
+# The model + real data load at startup (~20-30s), so the probe must allow for
+# it or the orchestrator will kill the container in a restart loop.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
+  CMD python -c "import urllib.request,json,sys; \
+      d=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=5)); \
+      sys.exit(0 if d.get('ready') else 1)"
+
+CMD ["python", "-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]

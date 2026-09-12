@@ -1,0 +1,5 @@
+# Ingestion worker — same image, different entrypoint. Scale this replica count
+# independently of the API: embedding is the GPU/CPU-bound stage.
+FROM veritas-api:latest
+USER veritas
+CMD ["python", "-m", "scripts.run_worker", "--topics", "veritas.raw,veritas.changed"]
