@@ -1,0 +1,34 @@
+# Core — the model, training and retrieval are implemented in this repo;
+# these are the dependencies for things the project does NOT claim to implement
+# (BLAS, regex engines, plotting, serving).
+torch>=2.1
+numpy>=1.24
+regex>=2023.0          # \p{L} in the pre-tokenizer; there is an ASCII fallback
+networkx>=3.0          # evidence graph (swap for Neo4j at scale)
+matplotlib>=3.7        # notebook plots
+tqdm>=4.65
+
+# Notebooks
+jupyterlab>=4.0
+ipywidgets>=8.0
+
+# Serving (optional — not needed to train or evaluate)
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2.0
+redis>=5.0
+psycopg[binary]>=3.1
+structlog>=24.1
+
+# Speech interface (optional)
+# faster-whisper>=1.0
+# piper-tts>=1.2
+
+# Dev
+pytest>=7.4
+
+# Streaming (optional — the bus falls back to an in-process queue without it)
+kafka-python>=2.0.2
+
+# Real-data fetching
+certifi>=2024.2.2
