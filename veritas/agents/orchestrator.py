@@ -91,6 +91,40 @@ class Veritas:
 
         plan = self.planner.plan(question, history)
         trace.append(f"PLAN {plan.describe()}")
+
+        # Refuse question SHAPES the evidence store cannot settle, before
+        # spending a retrieval round. A forecast has no dated evidence because
+        # the future has not been filed; a causal question needs an explanatory
+        # source, and a table of figures is not one. Answering either with a
+        # historical number looks authoritative and answers something else.
+        from .planner import UNANSWERABLE_TYPES
+
+        if plan.question_type in UNANSWERABLE_TYPES:
+            why = ("This is a forecast. The knowledge base records only what has "
+                   "been reported and when; it holds no projections, so there is "
+                   "no evidence that could support a figure for a future period."
+                   if plan.question_type == "FORECAST" else
+                   "This asks for a cause. The knowledge base records what the "
+                   "reported values were and when they were filed, not why they "
+                   "changed; no explanatory source is on record.")
+            trace.append(f"ABSTAIN unanswerable-type={plan.question_type}")
+            ans = Answer(question=question,
+                         answer=f"I cannot establish this from the available evidence. {why}")
+            ans.abstained = True
+            ans.support_level = SupportLevel.INSUFFICIENT
+            ans.unknown = [why]
+            ans.iterations = 0
+            ans.trace = trace
+            if plan.entity and plan.attribute:
+                cur, valid_now = self.store.latest(plan.entity, plan.attribute)
+                if cur is not None:
+                    ans.current_status = (
+                        f"For reference, the most recent recorded {plan.attribute} for "
+                        f"{plan.entity} is {cur.value} covering "
+                        f"{cur.valid_from.date()} to {cur.valid_to.date()} "
+                        f"(source {cur.source_id}). That is a record, not an answer to "
+                        f"the question asked.")
+            return ans
         if self.cfg.verbose:
             print(f"[plan] {plan.describe()}")
 

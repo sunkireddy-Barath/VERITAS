@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence
 
 from ..evidence.claims import ATTRIBUTE_LEXICON
@@ -39,7 +40,38 @@ _QTYPE = {
     "COMPARISON": ("compare", "versus", " vs ", "difference between"),
     "MULTI_HOP": ("that acquired", "whose", "of the company that", "owned by"),
     "EXISTENCE": ("is there", "does ", "has ", "did "),
+    # Two question shapes the evidence store CANNOT answer, however much data
+    # it holds. Both were leaking: the entity and attribute matched, so the
+    # pipeline happily returned a historical figure as though it answered the
+    # question actually asked.
+    "FORECAST": ("going to be", "predict", "forecast", "expected to be",
+                 "projection", "guidance for", "next year", "in the future",
+                 "outlook for", "estimate for"),
+    "CAUSAL": ("why did", "why is", "why has", "what caused", "reason for",
+               "reasons for", "explain why", "due to what", "what drove",
+               "what led to"),
 }
+
+#: Substring cues miss "will Apple revenue be in 2030" -- the words are split
+#: by the subject. A word-boundary modal plus a future year is the reliable
+#: signal, and the future year alone is decisive: no filing can report a period
+#: that has not happened.
+_FORECAST_MODAL = re.compile(r"\b(will|shall|would|going to)\b", re.I)
+_YEAR_IN_Q = re.compile(r"\b(20\d{2})\b")
+
+
+def _is_forecast(question: str) -> bool:
+    now_year = datetime.now(timezone.utc).year
+    years = [int(y) for y in _YEAR_IN_Q.findall(question)]
+    if any(y > now_year for y in years):
+        return True
+    return bool(_FORECAST_MODAL.search(question))
+
+
+#: Question types that no amount of dated factual evidence can settle. The
+#: store records WHAT was true and WHEN; it holds no forecasts and no causal
+#: claims, so answering these from it would be fabrication by omission.
+UNANSWERABLE_TYPES = frozenset({"FORECAST", "CAUSAL"})
 
 _ENTITY = re.compile(r"\b([A-Z][\w&.\-]*(?:\s+[A-Z][\w&.\-]*){0,3})\b")
 _STOPHEADS = frozenset("What Who When Where Why How Is Are Was Were Does Did Has Have The A An".split())
@@ -99,7 +131,17 @@ class QueryPlanner:
 
     def _qtype(self, q: str) -> str:
         low = q.lower()
+        # FORECAST and CAUSAL are checked FIRST: "why did revenue increase in
+        # 2021" also matches HISTORICAL cues, and the historical reading is the
+        # one that produced a confident non-answer.
+        if _is_forecast(q):
+            return "FORECAST"
+        for qt in ("FORECAST", "CAUSAL"):
+            if any(c in low for c in _QTYPE[qt]):
+                return qt
         for qt, cues in _QTYPE.items():
+            if qt in ("FORECAST", "CAUSAL"):
+                continue
             if any(c in low for c in cues):
                 return qt
         return "CURRENT_STATE"
