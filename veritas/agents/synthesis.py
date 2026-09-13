@@ -33,6 +33,14 @@ from ..evidence.verifier import ClaimVerdict, Verdict, rewrite_unsupported
 from ..temporal.temporal_retrieval import TemporalIntent
 
 
+_LABELS = {"ceo": "CEO", "cto": "CTO", "cfo": "CFO"}
+
+
+def _label(attribute: str) -> str:
+    """Display name for an attribute key: "net_income" -> "net income"."""
+    return _LABELS.get(attribute, attribute.replace("_", " "))
+
+
 class SynthesisAgent:
     def __init__(self, model=None, tokenizer=None, device: str = "cpu",
                  temperature: float = 0.25, max_new_tokens: int = 220) -> None:
@@ -49,15 +57,15 @@ class SynthesisAgent:
         if assessment.current is not None and plan.attribute:
             v = assessment.current
             if getattr(assessment, "current_is_valid_now", True):
-                head = (f"As of the latest evidence, {plan.entity}'s {plan.attribute} is "
+                head = (f"As of the latest evidence, {plan.entity}'s {_label(plan.attribute)} is "
                         f"{v.value} (valid since {v.valid_from.date()}, "
                         f"source {v.source_id or 'unknown'}).")
             else:
-                # Never state a closed-period figure in the present tense.
-                head = (f"The most recently reported {plan.attribute} for {plan.entity} is "
+                # Never state a closed-period value in the present tense.
+                head = (f"The most recently recorded {_label(plan.attribute)} for {plan.entity} is "
                         f"{v.value}, covering {v.valid_from.date()} to {v.valid_to.date()} "
-                        f"(reported {v.recorded_at.date()} by {v.source_id or 'unknown'}). "
-                        f"No newer figure has been published.")
+                        f"(recorded {v.recorded_at.date()} by {v.source_id or 'unknown'}). "
+                        f"No later value is on record.")
         if plan.temporal and plan.temporal.intent == TemporalIntent.CHANGE:
             if assessment.changes:
                 head = " ".join(assessment.changes[:3])
@@ -68,22 +76,43 @@ class SynthesisAgent:
                 # rather than falling through to "the latest value", which
                 # answers a different question entirely.
                 series = sorted(assessment.historical, key=lambda v: v.valid_from)
-                pts = [f"{v.valid_from.date()} to {v.valid_to.date()}: {v.value}"
-                       for v in series[-6:]]
+                def end(v):
+                    return "present" if v.valid_to.year > 9000 else v.valid_to.date()
+
+                pts = [f"{v.valid_from.date()} to {end(v)}: {v.value}" for v in series[-6:]]
                 first, last = series[0], series[-1]
-                head = (f"{plan.entity}'s {plan.attribute} across "
+                head = (f"{plan.entity}'s {_label(plan.attribute)} across "
                         f"{len(series)} recorded periods -- " + "; ".join(pts) + ". "
                         f"Earliest on record {first.value} "
                         f"({first.valid_from.date()}); most recent {last.value} "
-                        f"({last.valid_to.date()}).")
+                        f"({last.valid_from.date()} to {end(last)}).")
         if plan.temporal and plan.temporal.intent in (TemporalIntent.HISTORICAL, TemporalIntent.AS_OF):
             hist = [h for h in assessment.historical
                     if h.valid_from <= plan.temporal.anchor < h.valid_to]
             if hist:
                 h = hist[-1]
-                head = (f"As of {plan.temporal.anchor.date()}, {plan.entity}'s {plan.attribute} "
-                        f"was {h.value} (valid {h.valid_from.date()} to "
-                        f"{'present' if h.valid_to.year > 9000 else h.valid_to.date()}).")
+                period = getattr(plan.temporal, "fiscal_period", None)
+                if period is not None:
+                    # The anchor is only the midpoint of the resolved period;
+                    # quoting it as "as of <date>" would name a day nobody asked about.
+                    head = (f"For fiscal year {period[2]} ({h.valid_from.date()} to "
+                            f"{h.valid_to.date()}), {plan.entity}'s {_label(plan.attribute)} "
+                            f"was {h.value}.")
+                else:
+                    head = (f"As of {plan.temporal.anchor.date()}, {plan.entity}'s "
+                            f"{_label(plan.attribute)} was {h.value} (valid "
+                            f"{h.valid_from.date()} to "
+                            f"{'present' if h.valid_to.year > 9000 else h.valid_to.date()}).")
+                if h.change_kind == "CORRECTED" and h.previous_value:
+                    # The present figure is the restated one; the original is
+                    # part of the record, not a rival source to "disagree" with.
+                    head += (f" This figure was restated on {h.recorded_at.date()} by "
+                             f"{h.source_id or 'the source'}; it was originally reported "
+                             f"as {h.previous_value}.")
+            else:
+                # Nothing on record for the asked time. Falling through to the
+                # latest value would answer "revenue in 1990" with this year's.
+                head = ""
         body = " ".join(lines)
         note = f" {assessment.note}" if assessment.note else ""
         return " ".join(p for p in (head, body, note.strip()) if p).strip()

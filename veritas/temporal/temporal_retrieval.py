@@ -92,6 +92,12 @@ class TemporalQuery:
     halflife_days: float = HALFLIFE_DAYS["default"]
     explicit_dates: List[datetime] = None
     attribute_hint: str = ""
+    #: True when the only time cue was a bare year ("revenue in 2021"). A bare
+    #: year names a reporting period, not a day, so the orchestrator re-anchors
+    #: it on the period that actually ends in that year.
+    year_only: bool = False
+    #: (valid_from, valid_to, year) of the fiscal period a bare year resolved to.
+    fiscal_period: Optional[Tuple[datetime, datetime, int]] = None
 
     @property
     def wants_both_states(self) -> bool:
@@ -144,7 +150,9 @@ def parse_temporal_query(query: str, attribute_hint: str = "", ref_time: Optiona
         return TemporalQuery(TemporalIntent.CURRENT, ref, None, None, halflife, dates, attribute_hint)
     if dates:
         intent = TemporalIntent.AS_OF if "as of" in q else TemporalIntent.HISTORICAL
-        return TemporalQuery(intent, max(dates), None, None, halflife, dates, attribute_hint)
+        year_only = len(dates) == 1 and not _MONTH_YEAR.search(q)
+        return TemporalQuery(intent, max(dates), None, None, halflife, dates, attribute_hint,
+                             year_only=year_only)
     if any(c in q for c in _PAST_CUES):
         return TemporalQuery(TemporalIntent.HISTORICAL, ref, None, None, halflife, dates, attribute_hint)
     # Default to CURRENT, not ATEMPORAL: in a changing-world system, an

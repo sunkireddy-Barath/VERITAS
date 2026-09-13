@@ -197,7 +197,10 @@ def extract_claims(
                 char_span=(base_offset + s_off, base_offset + s_off + len(part)),
                 checkable=not bool(_OPINION.search(part)),
                 hedged=bool(_HEDGE.search(part)),
-                numeric=num,
+                # A person-valued claim has no numeric value: the year in
+                # "named Tim Cook CEO, effective 2011" is a date, and comparing
+                # it as a number made every succession look like a conflict.
+                numeric=None if attribute in PERSON_ATTRIBUTES else num,
                 unit=unit,
                 claim_id=f"{chunk_id or doc_id}:c{len(claims)}",
             )

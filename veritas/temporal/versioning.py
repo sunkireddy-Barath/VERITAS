@@ -280,6 +280,16 @@ class TemporalStore:
                 kind = ChangeKind.CHANGED
                 prior.valid_to = min(prior.valid_to, vf)   # close the old interval
                 note = "state transition"
+            elif (source_id and source_id == prior.source_id and rec > prior.recorded_at
+                  and vf == prior.valid_from and vt == prior.valid_to):
+                # The SAME source refiling the SAME period with a new value is a
+                # restatement, not a dispute: Apple's FY2008 net income was filed
+                # as 4.83B, then restated to 6.12B. Close transaction time on the
+                # original and keep it, so "what did we believe in 2009" still
+                # returns 4.83B while the present answer is the restated figure.
+                kind = ChangeKind.CORRECTED
+                prior.superseded_at = rec
+                note = "restated by the same source"
             else:
                 # same valid time, different value -> genuine disagreement
                 kind = ChangeKind.CONFLICT
@@ -358,6 +368,18 @@ class TemporalStore:
     def history(self, entity: str, attribute: str, include_superseded: bool = False) -> List[Version]:
         vs = self._index.get((self.canonical(entity), attribute), [])
         return list(vs) if include_superseded else [v for v in vs if v.is_current_record]
+
+    def belief_history(self, entity: str, attribute: str, t) -> List[Version]:
+        """Every value ever held for `attribute` at valid time `t`, in the order
+        it was recorded -- superseded originals included.
+
+        This is the transaction-time axis made visible: for a restated figure it
+        reads "reported X on d1, restated to Y on d2". `as_of(t, known_at=d)`
+        answers one point on it; this returns the whole axis.
+        """
+        t = _dt(t)
+        vs = self._index.get((self.canonical(entity), attribute), [])
+        return sorted((v for v in vs if v.valid_at(t)), key=lambda v: v.recorded_at)
 
     def timeline(self, entity: str) -> List[Version]:
         """Every attribute of an entity, ordered -- the narrative of its change."""

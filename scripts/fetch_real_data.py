@@ -302,17 +302,37 @@ def build_corpus(target_mb: float) -> int:
 
 
 # ---------------------------------------------------------------- revisions
-_CEO_PAT = re.compile(
-    r"\|\s*(?:ceo|key_people|leader_name|chief_executive)\s*=\s*([^\n|]{3,160})", re.I
-)
-_REV_PAT = re.compile(r"\|\s*(?:revenue|net_income|num_employees)\s*=\s*([^\n|]{1,120})", re.I)
+def _infobox_field(wikitext: str, *names: str) -> str:
+    """The raw value of the first named infobox field that is present.
+
+    Captured up to the next "| field =" line, NOT the next "|": list and
+    currency templates contain "|" themselves, and cutting there stored
+    fragments like "{{US$" and "{{ubl" as if they were values.
+    """
+    for name in names:
+        m = re.search(rf"^\s*\|\s*{name}\s*=\s*(.*?)(?=^\s*\|\s*[\w ]+?\s*=|^\s*\}}\}}|\Z)",
+                      wikitext, re.I | re.M | re.S)
+        if m and m.group(1).strip():
+            return m.group(1)
+    return ""
+
+
+_WRAP_TEMPLATE = re.compile(r"\{\{\s*(?:small|nowrap|nobr)\s*\|([^{}]*)\}\}", re.I)
+_LIST_TEMPLATE = re.compile(
+    r"\{\{\s*(?:ubl|unbulleted list|plainlist|plain list|flatlist|hlist)\s*\|?", re.I)
+_MONEY_TEMPLATE = re.compile(r"\{\{\s*(US\$|USD|INR|JPY|EUR|€|£)[^|}]*\|\s*([^|}]+)[^}]*\}\}", re.I)
 
 
 def clean_wikitext(value: str) -> str:
-    """Strip wiki markup from an infobox value."""
+    """Strip wiki markup from an infobox value, keeping list items and amounts."""
     v = re.sub(r"<ref[^>]*>.*?</ref>", "", value, flags=re.S)
     v = re.sub(r"<ref[^>]*/>", "", v)
-    v = re.sub(r"\{\{[^{}]*\}\}", " ", v)
+    v = re.sub(r"<br\s*/?>", "; ", v, flags=re.I)
+    v = _WRAP_TEMPLATE.sub(r"\1", v)                 # "Tim Cook {{small|(CEO)}}"
+    v = _MONEY_TEMPLATE.sub(lambda m: f"{m.group(1)} {m.group(2).strip()}", v)
+    v = _LIST_TEMPLATE.sub("", v)                    # list items survive as "|"-separated
+    v = re.sub(r"\{\{[^{}]*\}\}", " ", v)            # leftovers: {{increase}}, {{as of}}
+    v = v.replace("}}", " ").replace("|", "; ").replace("\n*", "; ").replace("*", " ")
     v = re.sub(r"\[\[([^\]|]*\|)?([^\]]*)\]\]", r"\2", v)
     v = re.sub(r"''+", "", v)
     v = re.sub(r"<[^>]+>", " ", v)
@@ -361,18 +381,23 @@ def fetch_revisions(title: str, n: int = 24, years_back: int = 8) -> List[dict]:
             continue
 
         facts = {}
-        m = _CEO_PAT.search(wikitext)
-        if m:
-            val = clean_wikitext(m.group(1))
-            # key_people lists several names+roles; keep the first person only
-            val = re.split(r"\(|,|;", val)[0].strip()
-            if 3 < len(val) < 60 and not val.lower().startswith(("list", "see")):
-                facts["ceo"] = val
-        m = _REV_PAT.search(wikitext)
-        if m:
-            val = clean_wikitext(m.group(1))
-            if val:
-                facts["revenue"] = val[:60]
+        name = ""
+        ceo_field = _infobox_field(wikitext, "ceo", "chief_executive")
+        if ceo_field:
+            name = re.split(r"\(|;|,", clean_wikitext(ceo_field))[0].strip()
+        else:
+            # key_people lists several people, and the FIRST is usually the
+            # chair. Only an entry labelled as chief executive is the CEO.
+            for item in clean_wikitext(_infobox_field(wikitext, "key_people")).split(";"):
+                if re.search(r"\bCEO\b|chief executive", item, re.I):
+                    name = re.split(r"\(|,", item)[0].strip()
+                    break
+        if 3 < len(name) < 60 and re.search(r"[A-Za-z]{2}", name):
+            facts["ceo"] = name
+        revenue = clean_wikitext(_infobox_field(wikitext, "revenue"))
+        revenue = re.split(r"\(|;", revenue)[0].strip()
+        if re.search(r"\d", revenue):
+            facts["revenue"] = revenue[:60]
 
         if facts:
             out.append({
@@ -537,6 +562,76 @@ def build_sec_facts(companies=None, verbose: bool = True) -> int:
     return total
 
 
+# ------------------------------------------------------------ Wikidata CEOs
+#: Leadership comes from Wikidata's structured "chief executive officer" (P169)
+#: statements, not from scraping infoboxes. Each statement carries explicit
+#: start (P580) and end (P582) qualifiers -- a real VALID interval -- plus a
+#: date precision and references. Companies are joined on their SEC CIK
+#: (P5531), so the names line up exactly with the SEC facts.
+WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
+_PRECISION = {9: "year", 10: "month", 11: "day"}
+
+
+def build_wikidata_ceos(companies=None, verbose: bool = True) -> int:
+    REAL.mkdir(parents=True, exist_ok=True)
+    out = REAL / "ceo_facts.jsonl"
+    names = {cik: name for name, cik in (companies or SEC_COMPANIES)}
+    values = " ".join(f'"{cik}"' for cik in names)
+    query = f"""
+SELECT ?item ?cik ?ceo ?ceoLabel ?start ?startPrec ?end ?endPrec ?rank
+       (COUNT(DISTINCT ?ref) AS ?nrefs) WHERE {{
+  VALUES ?cik {{ {values} }}
+  ?item wdt:P5531 ?cik ; p:P169 ?st .
+  ?st ps:P169 ?ceo ; wikibase:rank ?rank .
+  FILTER(?rank != wikibase:DeprecatedRank)
+  OPTIONAL {{ ?st pqv:P580 [ wikibase:timeValue ?start ; wikibase:timePrecision ?startPrec ] }}
+  OPTIONAL {{ ?st pqv:P582 [ wikibase:timeValue ?end ; wikibase:timePrecision ?endPrec ] }}
+  OPTIONAL {{ ?st prov:wasDerivedFrom ?ref }}
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en,mul". }}
+}} GROUP BY ?item ?cik ?ceo ?ceoLabel ?start ?startPrec ?end ?endPrec ?rank"""
+    data = json.loads(get(WIKIDATA_SPARQL, {"query": query, "format": "json"}, pause=1.0))
+    retrieved = datetime.now(timezone.utc).date().isoformat()
+
+    def val(row, key):
+        return row.get(key, {}).get("value", "")
+
+    seen, rows, skipped = set(), [], 0
+    for b in data["results"]["bindings"]:
+        label, start = val(b, "ceoLabel"), val(b, "start")
+        # No start date = no place on a timeline (Intel lists an interim
+        # co-CEO with no dates). A label that is just a QID has no name.
+        if not start or re.fullmatch(r"Q\d+", label):
+            skipped += 1
+            continue
+        end = val(b, "end")
+        cik = val(b, "cik")
+        key = (cik, val(b, "ceo"), start[:11], end[:11])
+        if key in seen:
+            continue
+        seen.add(key)
+        item = val(b, "item").rsplit("/", 1)[-1]
+        rows.append({
+            "entity": names[cik], "cik": cik, "attribute": "ceo", "value": label,
+            "person_qid": val(b, "ceo").rsplit("/", 1)[-1], "item_qid": item,
+            "valid_from": start.lstrip("+")[:10],
+            "valid_to": end.lstrip("+")[:10] if end else None,
+            "start_precision": _PRECISION.get(int(val(b, "startPrec") or 11), "day"),
+            "end_precision": _PRECISION.get(int(val(b, "endPrec") or 11), "day") if end else None,
+            "rank": val(b, "rank").rsplit("#", 1)[-1],
+            "references": int(val(b, "nrefs") or 0),
+            "retrieved": retrieved, "source": "wikidata.org",
+            "url": f"https://www.wikidata.org/wiki/{item}#P169",
+        })
+    rows.sort(key=lambda r: (r["entity"], r["valid_from"]))
+    with open(out, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    if verbose:
+        print(f"[ceo] wrote {out}: {len(rows)} dated CEO tenures for "
+              f"{len({r['entity'] for r in rows})} companies ({skipped} undated skipped)")
+    return len(rows)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--corpus-mb", type=float, default=12.0)
@@ -546,15 +641,19 @@ def main() -> None:
     ap.add_argument("--revisions-only", action="store_true")
     ap.add_argument("--feeds-only", action="store_true")
     ap.add_argument("--sec-only", action="store_true")
+    ap.add_argument("--ceo-only", action="store_true")
     args = ap.parse_args()
 
-    do_all = not (args.corpus_only or args.revisions_only or args.feeds_only or args.sec_only)
+    do_all = not (args.corpus_only or args.revisions_only or args.feeds_only
+                  or args.sec_only or args.ceo_only)
     if do_all or args.corpus_only:
         build_corpus(args.corpus_mb)
     if do_all or args.revisions_only:
         build_revisions(ENTITIES[: args.entities], args.revisions_per_entity)
     if do_all or args.sec_only:
         build_sec_facts()
+    if do_all or args.ceo_only:
+        build_wikidata_ceos()
     if do_all or args.feeds_only:
         build_feeds()
     print("\nDone. Real data in data/raw/corpus.txt and data/real/*.jsonl")

@@ -2,12 +2,13 @@
 
 help:
 	@echo "VERITAS"
-	@echo "  make data        fetch real data (SEC, Gutenberg, live feeds)"
-	@echo "  make test        11 unit/integration tests"
-	@echo "  make verify      7 behaviour checks against real SEC filings"
+	@echo "  make data        fetch real data (SEC, Wikidata CEOs, Gutenberg, live feeds)"
+	@echo "  make test        17 unit/integration tests"
+	@echo "  make verify      13 answer checks against real SEC filings and Wikidata"
 	@echo "  make eval        baseline ablation ladder"
 	@echo "  make notebooks   execute all 8 notebooks headless"
-	@echo "  make api         run the API locally (http://localhost:8000)"
+	@echo "  make api         run the API + UI locally (http://localhost:8000)"
+	@echo "  make web         serve the UI alone on http://localhost:3000 (needs make api)"
 	@echo "  make docker      build + run the full stack"
 	@echo "  make kafka       full stack including the streaming pipeline"
 	@echo "  make deploy-api  deploy the backend to Fly.io"
@@ -30,6 +31,9 @@ notebooks:
 
 api:
 	python run_veritas.py
+
+web:
+	python -m http.server 3000 --directory frontend
 
 docker:
 	docker compose up -d --build

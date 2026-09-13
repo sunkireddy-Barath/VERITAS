@@ -103,6 +103,19 @@ class QueryPlanner:
         self.tok = tokenizer
         self.domain_hint = domain_hint
 
+    @staticmethod
+    def candidates(q: str) -> List[str]:
+        """Every capitalised phrase in the question, in order, question words
+        trimmed. A comparison names several entities; this returns them all."""
+        cands = []
+        for m in _ENTITY.finditer(q):
+            words = m.group(1).split()
+            while words and words[0] in _STOPHEADS:
+                words = words[1:]
+            if words:
+                cands.append(" ".join(words).strip())
+        return cands
+
     def _entity(self, q: str) -> str:
         """Longest capitalised phrase, after trimming leading question words.
 
@@ -111,13 +124,7 @@ class QueryPlanner:
         candidate loses the entity entirely -- which sends the whole pipeline
         after the wrong subject.
         """
-        cands = []
-        for m in _ENTITY.finditer(q):
-            words = m.group(1).split()
-            while words and words[0] in _STOPHEADS:
-                words = words[1:]
-            if words:
-                cands.append(" ".join(words).strip())
+        cands = self.candidates(q)
         return max(cands, key=len) if cands else ""
 
     def _attribute(self, q: str) -> str:

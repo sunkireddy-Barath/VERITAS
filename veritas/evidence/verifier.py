@@ -139,6 +139,27 @@ def polarity_conflict(claim_text: str, evidence_text: str) -> bool:
     return lexical_entailment(claim_text, evidence_text) >= 0.5
 
 
+def person_conflict(claim: Claim, evidence_text: str) -> bool:
+    """Two different people named for the same role.
+
+    Person-valued claims carry no number, so `numeric_conflict` cannot see
+    "Tim Cook" against "Steve Jobs". Names are compared by shared tokens, so a
+    truncated "Samuel J" still agrees with "Samuel J. Palmisano".
+    """
+    from .claims import PERSON_ATTRIBUTES, _canonical_attribute, _extract_value
+
+    if claim.attribute not in PERSON_ATTRIBUTES or not claim.value:
+        return False
+    if _canonical_attribute(evidence_text) != claim.attribute:
+        return False
+    other = _extract_value(evidence_text, claim.attribute, None, "")
+    if not other:
+        return False
+    a = {t for t in re.findall(r"[a-z]+", claim.value.lower()) if len(t) > 2}
+    b = {t for t in re.findall(r"[a-z]+", other.lower()) if len(t) > 2}
+    return bool(a) and bool(b) and not (a & b)
+
+
 def temporal_mismatch(claim: Claim, ev: EvidenceItem, anchor: Optional[str]) -> bool:
     """The evidence's validity interval does not cover the asked-about time."""
     if anchor is None or ev.valid_to is None:
@@ -203,7 +224,9 @@ class ClaimVerifier:
                 ev.score = score
                 refuting.append(ev)
                 continue
-            if polarity_conflict(claim.text, ev.text):
+            if polarity_conflict(claim.text, ev.text) or (
+                    person_conflict(claim, ev.text)
+                    and lexical_entailment(claim.text, ev.text) >= 0.4):
                 ev.score = score
                 refuting.append(ev)
                 continue

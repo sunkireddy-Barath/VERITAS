@@ -88,13 +88,17 @@
 <script type="text/babel">
 const {useState,useEffect,useRef} = React;
 // Same-origin when served by FastAPI; window.VERITAS_API when deployed to a
-// static host with the backend elsewhere. One file, both deployments.
-const API = (typeof window !== "undefined" && window.VERITAS_API) || "";
+// static host with the backend elsewhere. One file, both deployments. Served
+// by a local static server instead (python -m http.server 3000), same-origin
+// has no API behind it, so fall back to the local backend on port 8000.
+const API = (typeof window !== "undefined" && window.VERITAS_API)
+  || ((["localhost", "127.0.0.1"].includes(location.hostname) && location.port !== "8000")
+      ? `${location.protocol}//${location.hostname}:8000` : "");
 
 const EXAMPLES = [
   "Who is the current CEO of Apple Inc.?",
   "Who was the CEO of Microsoft in 2020?",
-  "How did the CEO of Twitter change over time?",
+  "How did the CEO of Microsoft change over time?",
   "What is Nvidia's revenue?",
 ];
 

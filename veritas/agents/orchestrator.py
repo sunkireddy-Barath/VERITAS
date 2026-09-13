@@ -85,9 +85,13 @@ class Veritas:
         self.provenance = ProvenanceBuilder(graph, store)
 
     # ------------------------------------------------------------------ run
-    def answer(self, question: str, history: Optional[Sequence[str]] = None) -> Answer:
+    def answer(self, question: str, history: Optional[Sequence[str]] = None,
+               mode: Optional[str] = None) -> Answer:
+        """Answer one question. `mode` ("extractive" | "generative") applies to
+        this call only; the configured default is used when it is omitted."""
         t0 = time.time()
         trace: List[str] = []
+        mode = mode or self.cfg.synthesis_mode
 
         plan = self.planner.plan(question, history)
         trace.append(f"PLAN {plan.describe()}")
@@ -128,6 +132,24 @@ class Veritas:
         if self.cfg.verbose:
             print(f"[plan] {plan.describe()}")
 
+        # "Revenue in 2021" names a FISCAL year, and a fiscal year is labelled
+        # by the calendar year it ENDS in: Microsoft's FY2021 runs July 2020 to
+        # June 2021. A fixed mid-year anchor lands inside the next year's period
+        # for every company whose year does not end in December, which answered
+        # "Microsoft revenue in 2021" with the FY2022 figure. Re-anchor on the
+        # annual period that actually ends in the asked year.
+        tq = plan.temporal
+        if tq is not None and tq.year_only and plan.entity and plan.attribute:
+            year = tq.anchor.year
+            annual = [v for v in self.store.history(plan.entity, plan.attribute)
+                      if v.valid_to.year == year
+                      and 300 <= (v.valid_to - v.valid_from).days <= 380]
+            if annual:
+                p = max(annual, key=lambda v: v.recorded_at)
+                tq.anchor = p.valid_from + (p.valid_to - p.valid_from) / 2
+                tq.fiscal_period = (p.valid_from, p.valid_to, year)
+                trace.append(f"FISCAL_YEAR {year} -> {p.valid_from.date()}..{p.valid_to.date()}")
+
         queries = list(plan.sub_queries)
         seen: Dict[str, EvidenceItem] = {}
         suff = None
@@ -161,9 +183,34 @@ class Veritas:
 
         evidence = list(seen.values())
 
+        # ---- the stored value the answer states -------------------------------
+        # The headline comes from the temporal store, so the documents that
+        # asserted that value must be in the evidence and cited. Retrieval alone
+        # missed them ("CEO" never appears in "chief executive officer"), which
+        # left "Apple's CEO is ..." with no citation at all.
+        head = self._head_versions(plan, assessment)
+        head_docs = {eid for v in head for eid in v.evidence_ids}
+        head_evidence = [e for e in evidence
+                         if self.metadata.get(e.doc_id, {}).get("doc_id") in head_docs]
+        have = {e.doc_id for e in evidence}
+        for cid, md in self.metadata.items():
+            if md.get("doc_id") in head_docs and cid not in have:
+                item = EvidenceItem(
+                    doc_id=cid, text=self.corpus.get(cid, ""),
+                    source=str(md.get("source", cid)), date=md.get("date"),
+                    tier=int(md.get("tier", 3)), valid_from=md.get("valid_from"),
+                    valid_to=md.get("valid_to"), score=1.0)
+                evidence.append(item)
+                head_evidence.append(item)
+                have.add(cid)
+        if head:
+            trace.append(f"HEAD versions={len(head)} documents={len(head_evidence)}")
+
         # ---- claim extraction + verification --------------------------------
         candidate_claims = []
-        for e in evidence[: self.cfg.k]:
+        # Claims are drawn from the documents behind the stated value when there
+        # are any; every retrieved document still takes part in verifying them.
+        for e in (head_evidence or evidence[: self.cfg.k]):
             # Only supply the entity as the subject hint when the document
             # ACTUALLY MENTIONS it. Forcing the hint unconditionally rewrites
             # every retrieved document's claims as if they were about the asked
@@ -229,6 +276,12 @@ class Veritas:
         conflicts = []
         if plan.entity and plan.attribute:
             for a, b in self.store.conflicts(plan.entity, plan.attribute):
+                # Only a dispute about the period the answer states counts
+                # against it: Apple's FY2008 restatement is no reason to label
+                # its FY2020 net income CONFLICTED.
+                if head and not any(a.valid_from < h.valid_to and h.valid_from < a.valid_to
+                                    for h in head):
+                    continue
                 conflicts.append(self.contradiction.compare_versions(a, b, plan.domain))
         for i, va in enumerate(verdicts):
             for vb in verdicts[i + 1:]:
@@ -248,7 +301,12 @@ class Veritas:
         # ---- abstention -------------------------------------------------------
         n_supported = sum(v.verdict == Verdict.SUPPORTED for v in verdicts)
         n_stale = sum(v.verdict == Verdict.TEMPORAL_MISMATCH for v in verdicts)
-        has_store_value = assessment is not None and assessment.current is not None
+        # For a point-in-time question the store value only counts when it is
+        # the one being stated; the latest value does not answer "in 1990".
+        if plan.temporal and plan.temporal.intent in ("CURRENT", "HISTORICAL", "AS_OF"):
+            has_store_value = bool(head)
+        else:
+            has_store_value = assessment is not None and assessment.current is not None
         abstain, reason = self.abstention.should_abstain(
             suff, metrics["coverage"], n_supported, n_stale, has_store_value)
 
@@ -314,19 +372,43 @@ class Veritas:
         # revenue document "refutes" a net-income claim purely because the
         # numbers differ -- a false CONFLICTED on every financial question.
         words = ATTRIBUTE_LEXICON.get(claim.attribute, ()) if claim.attribute else ()
+        # Evidence about a DIFFERENT company can neither support nor refute the
+        # claim. Without this, Uber's revenue for an overlapping period
+        # "refuted" Apple's, and the fallback below brought it back even when
+        # every same-company document had been filtered out.
+        same_subject = [e for e in evidence
+                        if not re.search(r"[a-z0-9]{3,}", claim.subject.lower())
+                        or _mentions(e.text, claim.subject)]
         pool: List[EvidenceItem] = []
-        for e in evidence:
+        for e in same_subject:
             if claim_span and (e.valid_from or e.valid_to):
                 if not _spans_overlap(claim_span, (e.valid_from, e.valid_to)):
                     continue
             if words and not any(w in e.text.lower() for w in words):
                 continue
             pool.append(e)
-        pool = pool or list(evidence)
+        pool = pool or same_subject
 
         scored = [(lexical_entailment(claim.text, e.text), e) for e in pool]
         scored.sort(key=lambda t: -t[0])
         return [e for sc, e in scored[:5] if sc > 0.15] or [e for _sc, e in scored[:2]]
+
+    @staticmethod
+    def _head_versions(plan, assessment) -> List:
+        """The stored versions the answer's headline states (mirrors synthesis).
+
+        Empty for a change question, whose answer is the whole timeline, and
+        for a point-in-time question with nothing on record for that time.
+        """
+        if assessment is None or not plan.temporal or not plan.attribute:
+            return []
+        intent = plan.temporal.intent
+        if intent == "CURRENT":
+            return [assessment.current] if assessment.current is not None else []
+        if intent in ("HISTORICAL", "AS_OF"):
+            anchor = plan.temporal.anchor
+            return [h for h in assessment.historical if h.valid_from <= anchor < h.valid_to]
+        return []
 
     def _doc_span(self, doc_id: str):
         md = self.metadata.get(doc_id)
@@ -361,6 +443,10 @@ class Veritas:
                                       (anchor.isoformat(), anchor.isoformat())):
                     continue
             hint = plan.entity if _mentions(e.text, plan.entity) else ""
+            # Other companies' values are not votes on this one: AMD's and
+            # Apple's CEOs made "Microsoft's CEO in 2020" look disputed.
+            if plan.entity and not hint:
+                continue
             for c in extract_claims(e.text, e.doc_id, e.doc_id, hint):
                 if c.attribute == plan.attribute and c.value:
                     vals[c.value.lower()] += 1
@@ -407,10 +493,23 @@ def _mentions(text: str, entity: str) -> bool:
     return bool(toks) and all(t in low for t in toks)
 
 
+_CORPORATE_SUFFIXES = frozenset(
+    "inc incorporated corp corporation co company ltd limited plc llc lp "
+    "holdings group nv sa ag se the".split()
+)
+
+
 def _entity_overlap(subject: str, entity: str) -> bool:
     """Token-overlap entity match: "Acme" matches "Acme Industries", but
     "Helios Energy" does not match "Nova Logistics". Substring matching alone
-    would let a one-character company name match everything."""
-    a = {w for w in subject.replace(".", " ").split() if len(w) > 2}
-    b = {w for w in entity.replace(".", " ").split() if len(w) > 2}
+    would let a one-character company name match everything.
+
+    Corporate suffixes carry no identity: "Uber Technologies Inc." shares only
+    "Inc" with "Apple Inc", and counting it put Uber's revenue into an answer
+    about Apple as a "disagreeing source"."""
+    def toks(s: str) -> set:
+        return {w for w in re.findall(r"[a-z0-9]+", s.lower())
+                if len(w) > 2 and w not in _CORPORATE_SUFFIXES}
+
+    a, b = toks(subject), toks(entity)
     return bool(a & b) if (a and b) else subject in entity or entity in subject

@@ -70,6 +70,9 @@ class Answer:
     coverage: float = 0.0
     iterations: int = 0
     trace: List[str] = field(default_factory=list)
+    #: One row per entity for a comparison question: entity, value, period,
+    #: source and whether that side could be established at all.
+    comparison: List[Dict] = field(default_factory=list)
 
     # ------------------------------------------------------------- rendering
     def to_markdown(self) -> str:
@@ -214,7 +217,15 @@ class ProvenanceBuilder:
                     is_current=bool(cur and v.version_id == cur.version_id),
                 ))
             for v in hist:
-                if v.change_kind in ("CHANGED", "CORRECTED"):
+                if v.change_kind == "CORRECTED":
+                    # A restatement is not the world changing; say what it is.
+                    ans.changes.append(
+                        f"{attribute} for {_fmt(v.valid_from)} to {_fmt(v.valid_to)} was "
+                        f"restated from '{v.previous_value}' to '{v.value}' on "
+                        f"{_fmt(v.recorded_at)} by {v.source_id or 'unknown source'}; "
+                        f"the original figure is kept in the audit trail."
+                    )
+                elif v.change_kind == "CHANGED":
                     ans.changes.append(
                         f"{attribute} changed from '{v.previous_value}' to '{v.value}' "
                         f"effective {_fmt(v.valid_from)}, first recorded {_fmt(v.recorded_at)} "

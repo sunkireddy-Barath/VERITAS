@@ -57,6 +57,9 @@ REAL_SOURCE_TIERS: Dict[str, int] = {
     "who.int": 1, "www.who.int": 1,
     "nasa.gov": 1, "www.nasa.gov": 1,
     "arxiv.org": 2, "export.arxiv.org": 2,
+    # Structured, referenced statements with explicit start/end dates: better
+    # than an infobox scrape, still not a primary source.
+    "wikidata.org": 2,
     "en.wikipedia.org": 3,
 }
 
@@ -103,6 +106,29 @@ def _iso(ts: str) -> str:
 
 
 # --------------------------------------------------------- wiki revisions
+#: The only infobox attribute asserted into the store. See load_wiki_revisions.
+_WIKI_ASSERTABLE = frozenset({"ceo"})
+
+
+def _clean_wiki_value(attribute: str, value: str) -> str:
+    """A usable infobox value, or "" when only markup survived extraction.
+
+    Older fetches cut values at the first "|" inside a template, leaving
+    fragments like "{{US$" or "{{ubl". An unclosed "{{" means everything after
+    it was lost, so the value is cut there and kept only if a name (or, for
+    revenue, a figure) remains.
+    """
+    v = str(value or "").split("{{", 1)[0]
+    v = re.sub(r"\[\[([^\]|]*\|)?([^\]]*)\]\]", r"\2", v)
+    v = re.sub(r"[\[\]{}|<>]", " ", v)
+    v = re.sub(r"\s+", " ", v).strip(" .,;:")
+    if not re.search(r"[A-Za-z]{2}", v):
+        return ""
+    if attribute == "revenue" and not re.search(r"\d", v):
+        return ""
+    return v
+
+
 def load_wiki_revisions(
     builder, path: str | Path, max_entities: int = 0, verbose: bool = True
 ) -> Dict[str, int]:
@@ -123,17 +149,26 @@ def load_wiki_revisions(
         keep = list(dict.fromkeys(r["entity"] for r in records))[:max_entities]
         records = [r for r in records if r["entity"] in keep]
 
-    stats = {"records": 0, "versions": 0, "transitions": 0, "entities": 0, "docs": 0}
+    stats = {"records": 0, "versions": 0, "transitions": 0, "entities": 0, "docs": 0,
+             "rejected": 0}
     builder.add_source("en.wikipedia.org", tier=3, domain="corporate")
 
     for r in records:
         entity = r["entity"]
         ts = _iso(r["timestamp"])
         doc_id = f"wiki:{entity}:{r['revid']}"
+        facts = {a: _clean_wiki_value(a, v)
+                 for a, v in r.get("changed", r.get("facts", {})).items()}
+        facts = {a: v for a, v in facts.items() if v}
+        if not facts:
+            # Only markup survived extraction ("{{US$", "{{ubl"). Storing that
+            # as a fact is how "{{US$" became Nvidia's current revenue.
+            stats["rejected"] += 1
+            continue
 
         # The revision becomes a real, citable evidence document.
         parts = [f"{entity} (Wikipedia revision {r['revid']}, {ts})."]
-        for attr, val in r.get("changed", r.get("facts", {})).items():
+        for attr, val in facts.items():
             label = {"ceo": "chief executive", "revenue": "revenue"}.get(attr, attr)
             parts.append(f"The {label} is {val}.")
         if r.get("comment"):
@@ -141,14 +176,20 @@ def load_wiki_revisions(
         text = " ".join(parts)
 
         builder.add_document("en.wikipedia.org", doc_id, text, ts, entity,
-                             tier=3, url=r.get("url", ""))
+                             tier=3, url=r.get("url", ""), assert_claims=False)
         stats["docs"] += 1
 
         # The fact itself, asserted with the revision timestamp as the time we
         # LEARNED it. valid_from is the same here because a Wikipedia revision
         # does not state an effective date -- an SEC filing does, which is why
         # the two loaders differ.
-        for attr, val in r.get("changed", {}).items():
+        for attr, val in facts.items():
+            # An infobox revenue states no fiscal period, so asserting it "valid
+            # since the edit" would outrank the filed figure as the current
+            # value. And a tier-3 infobox never rewrites a timeline a structured
+            # source already holds: it stays citable text, not a state change.
+            if attr not in _WIKI_ASSERTABLE or builder.store.history(entity, attr):
+                continue
             _v, event = builder.store.assert_fact(
                 entity=entity, attribute=attr, value=val,
                 valid_from=ts, recorded_at=ts,
@@ -164,7 +205,8 @@ def load_wiki_revisions(
     stats["entities"] = len(builder.store.entities())
     if verbose:
         print(f"[real] wiki revisions: {stats['records']} revisions, {stats['docs']} documents, "
-              f"{stats['entities']} entities, {stats['transitions']} real state transitions")
+              f"{stats['entities']} entities, {stats['transitions']} real state transitions, "
+              f"{stats['rejected']} rejected as markup-only")
     return stats
 
 
@@ -362,6 +404,113 @@ def load_sec_facts(builder, path: str | Path, max_entities: int = 0,
     return stats
 
 
+# ------------------------------------------------------------ Wikidata CEOs
+def _fmt_date(iso: str, precision: Optional[str]) -> str:
+    """Render a date no more precisely than the source states it."""
+    if precision == "year":
+        return iso[:4]
+    if precision == "month":
+        return datetime.fromisoformat(iso).strftime("%B %Y")
+    return iso
+
+
+def load_ceo_facts(builder, path: str | Path, max_entities: int = 0,
+                   verbose: bool = True) -> Dict[str, int]:
+    """Load dated CEO tenures (Wikidata P169) as one timeline per company.
+
+    Each tenure becomes its own citable document. The store, however, gets the
+    timeline cut at every start and end date, because the raw statements
+    overlap: a successor who starts weeks before the predecessor leaves, or
+    genuine co-CEOs (Netflix, 2020-2023). Asserting tenures one at a time would
+    let each start date silently truncate the tenure before it.
+    """
+    from collections import defaultdict
+    from datetime import timedelta
+
+    from ..temporal.versioning import FOREVER, _dt
+
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} not found. Run: python scripts/fetch_real_data.py --ceo-only")
+
+    rows = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    by_entity: Dict[str, List[dict]] = defaultdict(list)
+    for r in rows:
+        by_entity[r["entity"]].append(r)
+    entities = list(by_entity)[:max_entities] if max_entities else list(by_entity)
+
+    tier = REAL_SOURCE_TIERS["wikidata.org"]
+    builder.add_source("wikidata.org", tier=tier, domain="corporate")
+    stats = {"tenures": 0, "segments": 0, "transitions": 0, "entities": len(entities)}
+
+    def span(r):
+        return _dt(r["valid_from"]), (_dt(r["valid_to"]) if r.get("valid_to") else FOREVER)
+
+    with builder.ingest.bulk_load(verbose=False):
+        for entity in entities:
+            tenures = sorted(by_entity[entity], key=lambda r: r["valid_from"])
+            for r in tenures:
+                r["_doc"] = f"wikidata:{r['cik']}:{r['person_qid']}:{r['valid_from']}"
+                text = (f"{entity} named {r['value']} chief executive officer (CEO), effective "
+                        f"{_fmt_date(r['valid_from'], r.get('start_precision'))}")
+                text += (f"; the tenure ended {_fmt_date(r['valid_to'], r.get('end_precision'))}."
+                         if r.get("valid_to") else "; no end date is recorded.")
+                text += (f" Source: Wikidata statement P169 on {r['item_qid']}, "
+                         f"{r.get('references', 0)} reference(s), retrieved {r['retrieved']}.")
+                builder.add_document("wikidata.org", r["_doc"], text, r["retrieved"], entity,
+                                     tier=tier, url=r.get("url", ""), assert_claims=False)
+                for md in builder.metadata.values():
+                    if md.get("doc_id") == r["_doc"]:
+                        md["valid_from"] = r["valid_from"]
+                        md["valid_to"] = r.get("valid_to")
+                stats["tenures"] += 1
+
+            cuts = sorted({t for r in tenures for t in span(r)})
+            segments: List[dict] = []
+            for a, b in zip(cuts, cuts[1:]):
+                active = [r for r in tenures if span(r)[0] <= a and span(r)[1] >= b]
+                # A successor starting shortly before the predecessor leaves is a
+                # handover, not co-leadership: keep the later appointment.
+                active = [r for r in active
+                          if not any(span(s)[0] > span(r)[0]
+                                     and (span(r)[1] - span(s)[0]).days < 90 for s in active)]
+                if not active:
+                    continue
+                names = list(dict.fromkeys(r["value"] for r in active))
+                value = " and ".join(names) + (" (co-CEOs)" if len(names) > 1 else "")
+                docs = {r["_doc"] for r in active}
+                if segments and segments[-1]["value"] == value and segments[-1]["end"] == a:
+                    segments[-1]["end"] = b
+                    segments[-1]["docs"] |= docs
+                else:
+                    segments.append({"value": value, "start": a, "end": b, "docs": docs})
+
+            for i, seg in enumerate(segments):
+                nxt = segments[i + 1] if i + 1 < len(segments) else None
+                # Tenure end dates are inclusive ("until 23 Aug", successor from
+                # 24 Aug), so a one-day gap is a handover. Leaving the interval
+                # open lets the successor's assertion close it as a CHANGED event.
+                contiguous = nxt is not None and nxt["start"] - seg["end"] <= timedelta(days=1)
+                end = None if (contiguous or seg["end"] == FOREVER) else seg["end"].date().isoformat()
+                _v, event = builder.store.assert_fact(
+                    entity=entity, attribute="ceo", value=seg["value"],
+                    valid_from=seg["start"].date().isoformat(), valid_to=end,
+                    recorded_at=tenures[0]["retrieved"], source_id="wikidata.org",
+                    evidence_ids=sorted(seg["docs"]), confidence=0.7,
+                    reason="Wikidata P169 tenure",
+                )
+                stats["segments"] += 1
+                if event.kind == "CHANGED":
+                    stats["transitions"] += 1
+
+    if verbose:
+        print(f"[real] CEOs: {stats['tenures']} Wikidata tenures -> {stats['segments']} "
+              f"timeline segments for {stats['entities']} companies, "
+              f"{stats['transitions']} successions")
+    return stats
+
+
 def build_real_system(builder, data_dir: str | Path = "data/real",
                       max_entities: int = 0, verbose: bool = True) -> Dict[str, object]:
     """Load every available real source into a VeritasSystemBuilder."""
@@ -370,6 +519,11 @@ def build_real_system(builder, data_dir: str | Path = "data/real",
     sec = data_dir / "sec_facts.jsonl"
     if sec.exists():
         report["sec"] = load_sec_facts(builder, sec, max_entities, verbose)
+    # CEOs before Wikipedia revisions: the structured timeline must exist first
+    # so a tier-3 infobox cannot rewrite it (see load_wiki_revisions).
+    ceo = data_dir / "ceo_facts.jsonl"
+    if ceo.exists():
+        report["ceo"] = load_ceo_facts(builder, ceo, max_entities, verbose)
     rev = data_dir / "wiki_revisions.jsonl"
     if rev.exists():
         report["revisions"] = load_wiki_revisions(builder, rev, max_entities, verbose)

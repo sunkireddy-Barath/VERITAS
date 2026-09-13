@@ -131,6 +131,69 @@ def test_new_source_changes_answer_without_retraining():
     assert before.timeline != after.timeline or before.answer != after.answer
 
 
+def test_bare_year_is_year_only():
+    from veritas.temporal.temporal_retrieval import parse_temporal_query
+
+    assert parse_temporal_query("What was Microsoft revenue in 2021?").year_only
+    assert not parse_temporal_query("What was Microsoft revenue in March 2021?").year_only
+
+
+def test_fiscal_year_anchors_on_period_ending_that_year():
+    """FY2021 for a July-June company is 2020-07-01..2021-06-30. The old
+    mid-year anchor (2021-07-01) fell inside FY2022 and returned its figure."""
+    b, veritas, _bench = build_tiny_system()
+    for vf, vt, val in (("2020-07-01", "2021-06-30", "168.09 billion USD"),
+                        ("2021-07-01", "2022-06-30", "198.27 billion USD")):
+        b.store.assert_fact("Contoso Corporation", "revenue", val, valid_from=vf,
+                            valid_to=vt, recorded_at="2022-07-28", source_id="sec.gov")
+    ans = veritas.answer("What was Contoso revenue in 2021?")
+    assert any("FISCAL_YEAR 2021 -> 2020-07-01..2021-06-30" in t for t in ans.trace), ans.trace
+
+
+def test_entity_overlap_ignores_corporate_suffixes():
+    from veritas.agents.orchestrator import _entity_overlap
+
+    assert not _entity_overlap("uber technologies inc.", "apple inc")
+    assert _entity_overlap("apple inc", "apple inc.")
+
+
+def test_person_claims_compare_names_not_years():
+    from veritas.evidence.claims import extract_claims
+    from veritas.evidence.verifier import ClaimVerifier, EvidenceItem, Verdict
+
+    text = "Apple Inc. named Tim Cook chief executive officer, effective 2011-08-24."
+    c = extract_claims(text, "d0", "d0", "Apple Inc.")[0]
+    assert c.value == "Tim Cook" and c.numeric is None, (c.value, c.numeric)
+    same = EvidenceItem("d1", text, "wikidata.org")
+    other = EvidenceItem("d2", "Apple Inc. named Steve Jobs chief executive officer, "
+                               "effective 1997-09.", "wikidata.org")
+    v = ClaimVerifier()
+    assert v.verify_claim(c, [same]).verdict == Verdict.SUPPORTED
+    assert v.verify_claim(c, [same, other]).verdict == Verdict.CONFLICTED
+
+
+def test_wiki_markup_fragments_are_rejected():
+    from veritas.ingest.real_sources import _clean_wiki_value
+
+    assert _clean_wiki_value("revenue", "{{US$") == ""
+    assert _clean_wiki_value("ceo", "{{Unbulleted list") == ""
+    assert _clean_wiki_value("ceo", "Gautam Adani {{small") == "Gautam Adani"
+
+
+def test_wikitext_cleaner_keeps_list_items_and_amounts():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    from fetch_real_data import _infobox_field, clean_wikitext
+
+    box = ("{{Infobox company\n"
+           "| key_people = {{ubl|Arthur Levinson {{small|(chairman)}}|Tim Cook {{small|(CEO)}}}}\n"
+           "| revenue = {{increase}} {{US$|391.04 billion|link=yes}} (2024)\n"
+           "| website = example.com\n}}")
+    people = clean_wikitext(_infobox_field(box, "key_people"))
+    assert "Tim Cook (CEO)" in people, people
+    revenue = clean_wikitext(_infobox_field(box, "revenue"))
+    assert "US$ 391.04 billion" in revenue, revenue
+
+
 def test_streaming_pipeline_suppresses_unchanged():
     """The bus must run identically with or without Kafka, and stage 2 must
     stop unchanged documents before they reach the expensive stages."""

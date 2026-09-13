@@ -320,7 +320,8 @@ class IngestionPipeline:
         return [cur.source_id] if cur.source_id else list(self.sources)
 
     # ------------------------------------------------------------- indexing
-    def _add_chunks(self, chunks: Sequence[Chunk], published, source_id, tier, entity) -> None:
+    def _add_chunks(self, chunks: Sequence[Chunk], published, source_id, tier, entity,
+                    url: str = "") -> None:
         ids, texts = [], []
         for ch in chunks:
             self.corpus[ch.chunk_id] = ch.text
@@ -329,6 +330,8 @@ class IngestionPipeline:
                 "entity": entity, "doc_id": ch.doc_id, "heading": ch.heading_path,
                 "span": (ch.start_char, ch.end_char),
                 "valid_from": published, "valid_to": None,
+                # kept on the chunk so an answer can link its proof to the page
+                "url": url,
             }
             ids.append(ch.chunk_id)
             texts.append(ch.contextualized)

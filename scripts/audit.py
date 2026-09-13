@@ -16,16 +16,18 @@ failures: refusing costs the user an answer, fabricating costs them their trust.
 from __future__ import annotations
 
 import json
+import os
 import random
 import sys
 import time
 import urllib.error
 import urllib.request
 from collections import defaultdict
+from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-API = "http://127.0.0.1:8000"
+API = os.environ.get("VERITAS_API", "http://127.0.0.1:8000").rstrip("/")
 
 
 def ask(question: str, timeout: int = 90, retries: int = 6) -> dict:
@@ -73,20 +75,24 @@ def suite_accuracy(rows, n=50, seed=7):
     print("SUITE A -- ACCURACY on business questions (ground truth from filings)")
     print("=" * 74)
 
-    # Key by the period CONTAINING mid-year, not by fiscal-year-end.
-    #
-    # Walmart, Oracle and NVIDIA have off-calendar fiscal years. Asked "in
-    # 2019", the system returns the period covering mid-2019 and states the
-    # exact interval -- which is right. Keying truth by valid_to year made
-    # three correct answers score as wrong: a bug in the TEST, not the system.
-    by_key = defaultdict(set)
+    # Key by fiscal year as companies name it: the annual period that ENDS in
+    # the year. Microsoft's FY2021 is 2020-07-01..2021-06-30 and NVIDIA's FY2023
+    # ends 2023-01-29. An earlier key (the period containing mid-year) scored
+    # eleven correct fiscal-year answers as wrong once the system adopted the
+    # companies' own convention -- the answers state the exact period either way.
+    periods = defaultdict(set)
+    latest = {}
     for r in rows:
-        yr = int(r["valid_from"][:4])
-        mid = f"{yr}-07-01"
-        if r["valid_from"] <= mid < r["valid_to"]:
-            by_key[(r["entity"], r["attribute"], yr)].add(r["value"])
-    # One value only, so a restatement cannot make a correct answer look wrong.
-    clean = [(k, list(v)[0]) for k, v in by_key.items() if len(v) == 1]
+        days = (date.fromisoformat(r["valid_to"]) - date.fromisoformat(r["valid_from"])).days
+        if not 300 <= days <= 380:
+            continue
+        key = (r["entity"], r["attribute"], int(r["valid_to"][:4]))
+        periods[key].add(r["valid_from"])
+        # A restatement supersedes the original: truth is the LATEST filing.
+        if key not in latest or r["filed"] > latest[key][0]:
+            latest[key] = (r["filed"], r["value"])
+    # Skip a year holding two different annual periods (a fiscal-year change).
+    clean = [(k, v) for k, (_f, v) in latest.items() if len(periods[k]) == 1]
 
     rng = random.Random(seed)
     rng.shuffle(clean)
@@ -136,7 +142,8 @@ def suite_hallucination(rows):
     probes = [
         ("attribute absent",  "What is Apple Inc headcount?"),
         ("attribute absent",  "What is Microsoft employee count?"),
-        ("attribute absent",  "Who is the CEO of Apple Inc?"),
+        # CEOs are on record now (Wikidata); a CFO is a known attribute with no data.
+        ("attribute absent",  "Who is the CFO of Apple Inc?"),
         ("entity absent",     "What was Zorblax Corporation revenue in 2023?"),
         ("entity absent",     "What was Umbrella Corporation net income in 2020?"),
         ("general knowledge", "What is the capital of France?"),
@@ -193,7 +200,9 @@ def suite_features(rows):
     c = ask("What is Apple Inc revenue?")
     ansc = (c.get("answer") or "").lower()
     record("2. Stale fact carries a qualifier",
-           ("no newer" in ansc or "most recently reported" in ansc) and not c.get("abstained"),
+           any(p in ansc for p in ("no later value", "most recently recorded",
+                                   "no newer", "most recently reported"))
+           and not c.get("abstained"),
            "closed fiscal period reported as last-known, not as current")
 
     # 3. real restatement surfaced as a conflict

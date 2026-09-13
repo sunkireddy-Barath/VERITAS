@@ -19,19 +19,23 @@ Design notes
   sees text. That keeps the server stateless with respect to audio and avoids
   shipping a 150 MB model; `/ask` is identical whether the question was typed
   or spoken.
+* **Both time axes are queryable.** `/entity/{name}/as_of` answers "what did we
+  believe on date K about date V", and `/changes` is the feed of every state
+  change, restatement and dispute the store has recorded.
 """
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import os
+import threading
 import time
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from collections import defaultdict, deque
-
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
@@ -40,13 +44,15 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = Path(__file__).resolve().parent / "static"
 
-app = FastAPI(title="VERITAS", version="0.1",
+app = FastAPI(title="VERITAS", version="0.2",
               description="Verified Evolving Reality & Intelligence Tracking System")
 
-# CORS is pinned by environment. The dev default is same-origin only; a
-# wildcard would let any site drive this API from a victim's browser.
+# CORS is pinned by environment. The dev default is the local origins only
+# (the API itself on 8000, the standalone frontend on 3000); a wildcard would
+# let any site drive this API from a victim's browser.
 _ORIGINS = [o.strip() for o in os.environ.get(
-    "VERITAS_ALLOWED_ORIGIN", "http://localhost:8000,http://127.0.0.1:8000"
+    "VERITAS_ALLOWED_ORIGIN",
+    "http://localhost:8000,http://127.0.0.1:8000,http://localhost:3000,http://127.0.0.1:3000",
 ).split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -67,8 +73,6 @@ def require_api_key(key: Optional[str] = Depends(_api_key_header)) -> None:
     if not _API_KEY:
         return
     # compare_digest: a plain == leaks key length and prefix through timing.
-    import hmac
-
     if not key or not hmac.compare_digest(key, _API_KEY):
         raise HTTPException(401, "invalid or missing X-API-Key")
 
@@ -77,14 +81,20 @@ def require_api_key(key: Optional[str] = Depends(_api_key_header)) -> None:
 # free: it protects a single instance from one abusive client. Behind more than
 # one replica, move the counter to Redis or the platform's edge limiter.
 _RATE_LIMIT = int(os.environ.get("VERITAS_RATE_LIMIT_PER_MIN", "60"))
+# X-Forwarded-For is client-controlled unless a proxy you run overwrites it.
+# Trusting it by default lets any client dodge the limit with a fake header, so
+# it is honoured only when the deployment says a proxy sits in front.
+_TRUST_PROXY = os.environ.get("VERITAS_TRUST_PROXY", "").lower() in ("1", "true", "yes")
+_MAX_TRACKED_CLIENTS = 10_000
 _hits: Dict[str, deque] = defaultdict(deque)
 
 
 def rate_limit(request: Request) -> None:
     if _RATE_LIMIT <= 0:
         return
-    ip = (request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-          or (request.client.host if request.client else "unknown"))
+    ip = request.client.host if request.client else "unknown"
+    if _TRUST_PROXY:
+        ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or ip
     now = time.time()
     window = _hits[ip]
     while window and now - window[0] > 60:
@@ -92,8 +102,19 @@ def rate_limit(request: Request) -> None:
     if len(window) >= _RATE_LIMIT:
         raise HTTPException(429, f"rate limit {_RATE_LIMIT}/min exceeded")
     window.append(now)
+    # Idle clients are swept so the table cannot grow without bound.
+    if len(_hits) > _MAX_TRACKED_CLIENTS:
+        for k in [k for k, w in _hits.items() if not w or now - w[-1] > 60]:
+            del _hits[k]
+
 
 STATE: Dict[str, Any] = {"ready": False, "error": None}
+
+# One lock around every read and write of the knowledge base. Answers iterate
+# the chunk metadata and the store while /ingest and /refresh append to them;
+# unsynchronised, a live ingest during an answer raises "dictionary changed
+# size during iteration". One model on one device serialises the work anyway.
+_KB_LOCK = threading.RLock()
 
 
 # --------------------------------------------------------------- lifecycle
@@ -157,6 +178,36 @@ def _require_ready():
     return STATE["veritas"]
 
 
+def _answer(question: str, history: List[str], mode: str):
+    # The mode is passed per call. Writing it into the shared config let one
+    # request's "generative" leak into a concurrent request's answer.
+    with _KB_LOCK:
+        return STATE["veritas"].answer(question, history, mode)
+
+
+def _parse_time(value: str, name: str):
+    from veritas.temporal.versioning import _dt
+
+    try:
+        return _dt(value, strict=True)
+    except ValueError:
+        raise HTTPException(422, f"'{name}' is not a date: {value!r} (use YYYY-MM-DD)")
+
+
+def _version_json(v) -> Dict[str, Any]:
+    return {
+        "value": v.value,
+        "valid_from": v.valid_from.date().isoformat(),
+        "valid_to": "present" if v.valid_to.year > 9000 else v.valid_to.date().isoformat(),
+        "recorded_at": v.recorded_at.date().isoformat(),
+        "superseded_at": v.superseded_at.date().isoformat() if v.superseded_at else None,
+        "source": v.source_id,
+        "change_kind": v.change_kind,
+        "previous_value": v.previous_value,
+        "reason": v.reason,
+    }
+
+
 # ------------------------------------------------------------------ models
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=3, max_length=500)
@@ -165,12 +216,12 @@ class AskRequest(BaseModel):
 
 
 class IngestRequest(BaseModel):
-    source_id: str
-    text: str
-    entity: str = ""
+    source_id: str = Field(..., min_length=1, max_length=200)
+    text: str = Field(..., min_length=1, max_length=200_000)
+    entity: str = Field("", max_length=200)
     published: str = ""
-    url: str = ""
-    tier: int = 3
+    url: str = Field("", max_length=2000)
+    tier: int = Field(3, ge=1, le=4)
 
 
 # ------------------------------------------------------------------ routes
@@ -189,25 +240,26 @@ def health() -> Dict[str, Any]:
 def stats() -> Dict[str, Any]:
     _require_ready()
     b = STATE["builder"]
-    return {
-        "corpus_chunks": len(b.corpus),
-        "entities": b.store.entities()[:200],
-        "entity_count": len(b.store.entities()),
-        "fact_versions": sum(len(v) for v in b.store._index.values()),
-        "state_changes": len([c for c in b.store.changes
-                              if c.kind in ("CHANGED", "CORRECTED")]),
-        "graph": b.graph.stats(),
-        "sources": sorted({m.get("source", "") for m in b.metadata.values() if m.get("source")}),
-        "load_report": STATE.get("report", {}),
-    }
+    with _KB_LOCK:
+        return {
+            "corpus_chunks": len(b.corpus),
+            "entities": b.store.entities()[:200],
+            "entity_count": len(b.store.entities()),
+            "fact_versions": sum(len(v) for v in b.store._index.values()),
+            "state_changes": len([c for c in b.store.changes
+                                  if c.kind in ("CHANGED", "CORRECTED")]),
+            "graph": b.graph.stats(),
+            "sources": sorted({m.get("source", "") for m in b.metadata.values()
+                               if m.get("source")}),
+            "load_report": STATE.get("report", {}),
+        }
 
 
 @app.post("/ask", dependencies=[Depends(rate_limit)])
 def ask(req: AskRequest) -> Dict[str, Any]:
-    veritas = _require_ready()
-    veritas.cfg.synthesis_mode = req.mode
+    _require_ready()
     t0 = time.time()
-    ans = veritas.answer(req.question, req.history)
+    ans = _answer(req.question, req.history, req.mode)
     out = ans.to_dict()
     out["elapsed_seconds"] = round(time.time() - t0, 3)
     return out
@@ -220,14 +272,14 @@ async def ask_stream(req: AskRequest) -> StreamingResponse:
     The agent's own `trace` is replayed as events, so what the UI shows is the
     real decision path, not a decorative progress bar.
     """
-    veritas = _require_ready()
+    _require_ready()
 
     async def gen():
         yield _sse("status", {"stage": "planning", "message": "Understanding the question"})
         loop = asyncio.get_event_loop()
         t0 = time.time()
         try:
-            ans = await loop.run_in_executor(None, veritas.answer, req.question, req.history)
+            ans = await loop.run_in_executor(None, _answer, req.question, req.history, req.mode)
         except Exception as exc:
             yield _sse("error", {"message": f"{type(exc).__name__}: {exc}"})
             return
@@ -248,39 +300,105 @@ def _sse(event: str, data: dict) -> str:
 
 @app.get("/entity/{name}/timeline")
 def timeline(name: str, attribute: str = "") -> Dict[str, Any]:
+    """Every version of every attribute, superseded originals included."""
     _require_ready()
     store = STATE["builder"].store
-    attrs = [attribute] if attribute else sorted(
-        {a for (e, a) in store._index if e == store.canonical(name)})
-    if not attrs:
-        raise HTTPException(404, f"no facts recorded for '{name}'")
-    out = {}
-    for attr in attrs:
-        cur = store.current(name, attr)
-        out[attr] = {
-            "current": cur.value if cur else None,
-            "versions": [{
-                "value": v.value,
-                "valid_from": v.valid_from.date().isoformat(),
-                "valid_to": "present" if v.valid_to.year > 9000 else v.valid_to.date().isoformat(),
-                "recorded_at": v.recorded_at.date().isoformat(),
-                "source": v.source_id,
-                "change_kind": v.change_kind,
-                "previous_value": v.previous_value,
-                "is_current": bool(cur and v.version_id == cur.version_id),
-            } for v in store.history(name, attr)],
+    with _KB_LOCK:
+        attrs = [attribute] if attribute else sorted(
+            {a for (e, a) in store._index if e == store.canonical(name)})
+        if not attrs or not any(store.history(name, a, include_superseded=True) for a in attrs):
+            raise HTTPException(404, f"no facts recorded for '{name}'")
+        out = {}
+        for attr in attrs:
+            cur = store.current(name, attr)
+            out[attr] = {
+                "current": cur.value if cur else None,
+                "versions": [dict(_version_json(v),
+                                  is_current=bool(cur and v.version_id == cur.version_id))
+                             for v in store.history(name, attr, include_superseded=True)],
+            }
+        return {"entity": store.canonical(name), "attributes": out}
+
+
+@app.get("/entity/{name}/as_of")
+def as_of(name: str, attribute: str, valid: str = "", known: str = "") -> Dict[str, Any]:
+    """Bitemporal time travel: the value valid on `valid`, as believed on `known`.
+
+    `known` omitted means "as we believe now". The belief history lists every
+    value held for that valid time in recording order, so a restatement reads
+    as "reported X, restated to Y" rather than as a silent overwrite.
+    """
+    _require_ready()
+    from veritas.temporal.versioning import _norm, now_utc
+
+    store = STATE["builder"].store
+    t = _parse_time(valid, "valid") if valid else now_utc()
+    k = _parse_time(known, "known") if known else None
+    with _KB_LOCK:
+        if not store.history(name, attribute, include_superseded=True):
+            raise HTTPException(404, f"no '{attribute}' recorded for '{name}'")
+        believed = store.as_of(name, attribute, t, k)
+        trail = [v for v in store.belief_history(name, attribute, t)
+                 if k is None or v.recorded_at <= k]
+        if believed is None:
+            note = ("Nothing was on record yet for that time." if k is not None
+                    and trail == [] else "No value is recorded as valid at that time.")
+        elif len({_norm(v.value) for v in trail}) > 1:
+            note = "The recorded value for this time was revised; see belief_history."
+        else:
+            note = ""
+        return {
+            "entity": store.canonical(name), "attribute": attribute,
+            "valid_at": t.date().isoformat(),
+            "known_at": k.date().isoformat() if k else "latest",
+            "value": believed.value if believed else None,
+            "version": _version_json(believed) if believed else None,
+            "belief_history": [_version_json(v) for v in trail],
+            "note": note,
         }
-    return {"entity": store.canonical(name), "attributes": out}
+
+
+@app.get("/changes")
+def changes(since: str = "", entity: str = "", kind: str = "",
+            limit: int = Query(50, ge=1, le=500)) -> Dict[str, Any]:
+    """The world-state change feed, newest recording first.
+
+    Defaults to the events that alter an answer -- CHANGED (the world moved),
+    CORRECTED (a source restated itself) and CONFLICT (sources disagree about
+    the same time) -- and leaves out mere reaffirmations.
+    """
+    _require_ready()
+    store = STATE["builder"].store
+    kinds = {x.strip().upper() for x in kind.split(",") if x.strip()} or {
+        "CHANGED", "CORRECTED", "CONFLICT"}
+    start = _parse_time(since, "since") if since else None
+    with _KB_LOCK:
+        ent = store.canonical(entity) if entity else None
+        rows = [c for c in store.changes
+                if c.kind in kinds and (ent is None or c.entity == ent)
+                and (start is None or c.detected_at >= start)]
+        rows.sort(key=lambda c: (c.detected_at, c.effective_at), reverse=True)
+        return {
+            "total": len(rows), "kinds": sorted(kinds),
+            "changes": [{
+                "entity": c.entity, "attribute": c.attribute, "kind": c.kind,
+                "old_value": c.old_value, "new_value": c.new_value,
+                "effective_at": c.effective_at.date().isoformat(),
+                "recorded_at": c.detected_at.date().isoformat(),
+                "source": c.source_id, "note": c.note,
+            } for c in rows[:limit]],
+        }
 
 
 @app.get("/entity/{name}/provenance")
 def provenance(name: str) -> Dict[str, Any]:
     _require_ready()
     g = STATE["builder"].graph
-    claims = g.claims_about(name)
-    if not claims:
-        raise HTTPException(404, f"no claims recorded about '{name}'")
-    return {"entity": name, "claims": [g.provenance_path(c) for c in claims[:40]]}
+    with _KB_LOCK:
+        claims = g.claims_about(name)
+        if not claims:
+            raise HTTPException(404, f"no claims recorded about '{name}'")
+        return {"entity": name, "claims": [g.provenance_path(c) for c in claims[:40]]}
 
 
 @app.post("/ingest", dependencies=[Depends(require_api_key), Depends(rate_limit)])
@@ -289,9 +407,11 @@ def ingest(req: IngestRequest) -> Dict[str, Any]:
     immediately -- no re-index, no retraining."""
     _require_ready()
     b = STATE["builder"]
-    b.add_source(req.source_id, tier=req.tier)
-    res = b.add_document(req.source_id, f"api:{int(time.time()*1000)}", req.text,
-                         req.published or time.strftime("%Y-%m-%d"), req.entity, url=req.url)
+    with _KB_LOCK:
+        b.add_source(req.source_id, tier=req.tier)
+        res = b.add_document(req.source_id, f"api:{time.time_ns()}", req.text,
+                             req.published or time.strftime("%Y-%m-%d"), req.entity,
+                             url=req.url)
     return {
         "changed": res.changed, "reason": res.reason, "chunks": res.n_chunks,
         "claims": res.n_claims, "state_changes": res.state_changes,
@@ -307,7 +427,8 @@ def refresh() -> Dict[str, Any]:
     from scripts.fetch_real_data import FEEDS  # single source of truth for feeds
     from veritas.ingest.real_sources import refresh_feeds
 
-    return refresh_feeds(STATE["builder"], FEEDS, verbose=False)
+    with _KB_LOCK:
+        return refresh_feeds(STATE["builder"], FEEDS, verbose=False)
 
 
 @app.get("/")
