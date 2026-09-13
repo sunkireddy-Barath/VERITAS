@@ -49,6 +49,9 @@ class TimelineEntry:
     recorded_at: str
     change_kind: str
     is_current: bool
+    #: Set when a later record replaced this one (a restatement). The row is
+    #: kept: it is what we believed until that date.
+    superseded_at: str = ""
 
 
 @dataclass
