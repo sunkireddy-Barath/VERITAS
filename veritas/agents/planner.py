@@ -37,7 +37,7 @@ _QTYPE = {
     "CURRENT_STATE": ("what is", "who is", "current", "now", "latest", "status of"),
     "HISTORICAL": ("what was", "who was", "in 20", "back in", "used to"),
     "CHANGE": ("how did", "change", "when did", "why did", "timeline", "evolve"),
-    "COMPARISON": ("compare", "versus", " vs ", "difference between"),
+    "COMPARISON": ("compare", "versus", " vs ", " vs. ", "difference between"),
     "MULTI_HOP": ("that acquired", "whose", "of the company that", "owned by"),
     "EXISTENCE": ("is there", "does ", "has ", "did "),
     # Two question shapes the evidence store CANNOT answer, however much data
@@ -74,7 +74,8 @@ def _is_forecast(question: str) -> bool:
 UNANSWERABLE_TYPES = frozenset({"FORECAST", "CAUSAL"})
 
 _ENTITY = re.compile(r"\b([A-Z][\w&.\-]*(?:\s+[A-Z][\w&.\-]*){0,3})\b")
-_STOPHEADS = frozenset("What Who When Where Why How Is Are Was Were Does Did Has Have The A An".split())
+_STOPHEADS = frozenset(
+    "What Who When Where Why How Is Are Was Were Does Did Has Have The A An Compare".split())
 
 
 @dataclass
@@ -143,11 +144,13 @@ class QueryPlanner:
         # one that produced a confident non-answer.
         if _is_forecast(q):
             return "FORECAST"
-        for qt in ("FORECAST", "CAUSAL"):
+        # COMPARISON next: "compare Apple and Microsoft revenue in 2023" also
+        # carries the HISTORICAL cue "in 20", and dict order let that win.
+        for qt in ("FORECAST", "CAUSAL", "COMPARISON"):
             if any(c in low for c in _QTYPE[qt]):
                 return qt
         for qt, cues in _QTYPE.items():
-            if qt in ("FORECAST", "CAUSAL"):
+            if qt in ("FORECAST", "CAUSAL", "COMPARISON"):
                 continue
             if any(c in low for c in cues):
                 return qt

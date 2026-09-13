@@ -36,3 +36,6 @@ Thumbs.db
 frontend/node_modules/
 frontend/.next/
 frontend/out/
+
+# Deploy staging and generated secrets (scripts/deploy_hf_space.py)
+.deploy/

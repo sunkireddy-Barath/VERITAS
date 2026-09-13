@@ -129,6 +129,19 @@ class Veritas:
                         f"(source {cur.source_id}). That is a record, not an answer to "
                         f"the question asked.")
             return ans
+
+        # A comparison is several point questions plus an honest join: each side
+        # is answered and verified on its own timeline, then placed beside the
+        # others with its own period. A side the store has no record of is named
+        # as unestablished rather than silently dropped.
+        if plan.question_type == "COMPARISON" and plan.attribute:
+            entities = self._comparison_entities(question, plan.attribute)
+            unmatched = [n for n in self.planner.candidates(question)
+                         if not self._comparison_entities(n, plan.attribute)
+                         and not self._is_attribute_phrase(n)]
+            if len(entities) + len(unmatched) >= 2:
+                trace.append(f"COMPARISON entities={entities} unrecognised={unmatched}")
+                return self._compare(question, plan, entities, unmatched, mode, trace, t0)
         if self.cfg.verbose:
             print(f"[plan] {plan.describe()}")
 
@@ -190,6 +203,21 @@ class Veritas:
         # left "Apple's CEO is ..." with no citation at all.
         head = self._head_versions(plan, assessment)
         head_docs = {eid for v in head for eid in v.evidence_ids}
+        # A document backing only a SUPERSEDED version is the prior record, not
+        # a rival source: Apple's original FY2008 10-K (4.83B) must not "refute"
+        # its own restatement (6.12B). The original stays in the timeline and in
+        # the synthesis note; it just does not vote in verification.
+        if plan.entity and plan.attribute:
+            superseded_docs = {
+                eid for v in self.store.history(plan.entity, plan.attribute,
+                                                include_superseded=True)
+                if v.superseded_at is not None for eid in v.evidence_ids} - head_docs
+            if superseded_docs:
+                kept = [e for e in evidence
+                        if self.metadata.get(e.doc_id, {}).get("doc_id") not in superseded_docs]
+                if len(kept) < len(evidence):
+                    trace.append(f"SUPERSEDED excluded={len(evidence) - len(kept)} documents")
+                evidence = kept
         head_evidence = [e for e in evidence
                          if self.metadata.get(e.doc_id, {}).get("doc_id") in head_docs]
         have = {e.doc_id for e in evidence}
@@ -324,9 +352,9 @@ class Veritas:
             label = SupportLevel.INSUFFICIENT
         else:
             answer_text = self.synthesis.compose(
-                plan, verdicts, assessment, self.verifier, lookup, self.cfg.synthesis_mode
+                plan, verdicts, assessment, self.verifier, lookup, mode
             )
-            trace.append(f"SYNTHESIS mode={self.cfg.synthesis_mode} chars={len(answer_text)}")
+            trace.append(f"SYNTHESIS mode={mode} chars={len(answer_text)}")
 
         ans = self.provenance.build(
             question=question, verdicts=verdicts, metrics=metrics,
@@ -337,6 +365,9 @@ class Veritas:
         )
         ans.abstained = abstain
         ans.iterations = iterations
+        # Not a dataclass field, so never serialised: the stored versions the
+        # headline states, for _compare to line up without re-deriving them.
+        ans._head = head
         if abstain and reason:
             ans.unknown.insert(0, reason)
         audit = CitationAgent.audit(answer_text, verdicts)
@@ -409,6 +440,213 @@ class Veritas:
             anchor = plan.temporal.anchor
             return [h for h in assessment.historical if h.valid_from <= anchor < h.valid_to]
         return []
+
+    # ------------------------------------------------------------ comparison
+    #: First tokens too generic to name a company alone: "Meta" names Meta
+    #: Platforms, but "General" does not name General Motors.
+    _GENERIC_HEADS = frozenset(
+        "general international advanced united american national first new global".split())
+    #: Weakest first. A comparison is only as well supported as its weakest side.
+    _LEVEL_RANK = [SupportLevel.INSUFFICIENT, SupportLevel.CONFLICTED, SupportLevel.LOW,
+                   SupportLevel.MODERATE, SupportLevel.HIGH]
+
+    def _comparison_entities(self, text: str, attribute: str) -> List[str]:
+        """Entities with a recorded `attribute` that `text` names, in order of mention.
+
+        Matched against the store's own names, not capitalised phrases: only
+        timelines the store holds can be compared. A name matches by all of its
+        core tokens ("Meta Platforms"), by a distinctive first token ("Meta"),
+        or by its initials written in capitals ("IBM", "AMD").
+        """
+        words = re.findall(r"[a-z0-9]+", text.lower())
+        caps = set(re.findall(r"\b[A-Z]{2,5}\b", text))
+        found = []
+        for ent in self.store.entities():
+            if not self.store.history(ent, attribute):
+                continue
+            core = [t for t in re.findall(r"[a-z0-9]+", ent.lower())
+                    if t not in _CORPORATE_SUFFIXES]
+            if not core:
+                continue
+            initials = "".join(t[0] for t in core).upper()
+            if all(t in words for t in core) or (
+                    len(core[0]) >= 4 and core[0] not in self._GENERIC_HEADS
+                    and core[0] in words):
+                found.append((words.index(core[0]), ent))
+            elif len(core) >= 2 and initials in caps:
+                found.append((words.index(initials.lower()), ent))
+        return list(dict.fromkeys(ent for _pos, ent in sorted(found)))
+
+    @staticmethod
+    def _is_attribute_phrase(phrase: str) -> bool:
+        """A capitalised phrase made only of attribute words ("CEO", "Revenue")."""
+        from ..evidence.claims import ATTRIBUTE_LEXICON
+
+        vocab = {t for words in ATTRIBUTE_LEXICON.values() for w in words for t in w.split()}
+        vocab |= {"fy", "usd", "q1", "q2", "q3", "q4"}
+        toks = re.findall(r"[a-z0-9]+", phrase.lower())
+        return bool(toks) and all(t in vocab for t in toks)
+
+    def _compare(self, question, plan, entities, unmatched, mode, trace, t0) -> Answer:
+        """Answer each side as its own question, then join them without lying.
+
+        Three rules make the join honest: every value keeps its own period (two
+        companies' "2023" are different fiscal windows, and the answer says so);
+        a computed difference is labelled as derived, never as reported; and the
+        comparison refuses unless at least two sides are actually established.
+        """
+        from ..evidence.claims import PERSON_ATTRIBUTES
+        from .synthesis import _label
+
+        tq = plan.temporal
+        label = _label(plan.attribute)
+        person = plan.attribute in PERSON_ATTRIBUTES
+        change = tq is not None and tq.intent == "CHANGE"
+        year = (tq.anchor.year if tq is not None and tq.explicit_dates
+                and tq.intent in ("HISTORICAL", "AS_OF") else None)
+
+        def sub_question(ent: str) -> str:
+            if change:
+                return f"How did the {label} of {ent} change over time?"
+            if person:
+                return (f"Who was the {label} of {ent} in {year}?" if year
+                        else f"Who is the current {label} of {ent}?")
+            return f"What was {ent} {label} in {year}?" if year else f"What is {ent} {label}?"
+
+        def row(entity, q=None, v=None, level=SupportLevel.INSUFFICIENT, cites=(), text=""):
+            ok = v is not None
+            return {
+                "entity": entity, "question": q, "established": ok,
+                "value": v.value if ok else None,
+                "valid_from": v.valid_from.date().isoformat() if ok else None,
+                "valid_to": (("present" if v.valid_to.year > 9000
+                              else v.valid_to.date().isoformat()) if ok else None),
+                "recorded_at": v.recorded_at.date().isoformat() if ok else None,
+                "source": v.source_id if ok else None,
+                "restated": bool(ok and v.change_kind == "CORRECTED"),
+                "support_level": level if ok else SupportLevel.INSUFFICIENT,
+                "citations": list(cites), "answer": text,
+            }
+
+        ans = Answer(question=question)
+        rows, done, coverage, scores = [], [], [], []
+        for ent in entities:
+            q = sub_question(ent)
+            sub = self.answer(q, None, mode)
+            trace.append(f"COMPARE {ent}: {q!r} -> "
+                         f"{'ABSTAIN' if sub.abstained else sub.support_level}")
+            trace.extend(f"  [{ent}] {line}" for line in sub.trace)
+
+            # Citation markers restart at [E1] in every sub-answer; renumber so
+            # each marker names exactly one document across the whole answer.
+            remap: Dict[str, str] = {}
+            for c in sub.citations:
+                new = f"[E{len(ans.citations) + 1}]"
+                remap[c.marker] = new
+                c.marker = new
+                ans.citations.append(c)
+
+            def relabel(text: str, remap=remap) -> str:
+                return re.sub(r"\[E\d+\]", lambda m: remap.get(m.group(0), m.group(0)), text)
+
+            for cl in sub.claims:
+                cl["citations"] = [remap.get(m, m) for m in cl.get("citations", [])]
+                cl["note"] = relabel(cl.get("note", ""))
+                ans.claims.append(cl)
+            ans.conflicts += [f"{ent}: {relabel(x)}" for x in sub.conflicts]
+            ans.unknown += [f"{ent}: {u}" for u in sub.unknown]
+            ans.iterations += sub.iterations
+
+            head = getattr(sub, "_head", [])
+            v = head[-1] if head else None
+            if v is None and change and not sub.abstained:
+                v, _valid_now = self.store.latest(ent, plan.attribute)
+            if sub.abstained:
+                v = None
+            rows.append(row(ent, q, v, sub.support_level, remap.values(), relabel(sub.answer)))
+            if v is not None:
+                done.append((rows[-1], v))
+                coverage.append(sub.coverage)
+                scores.append(sub.evidence_score)
+                if sub.last_verified and (ans.last_verified is None
+                                          or sub.last_verified > ans.last_verified):
+                    ans.last_verified = sub.last_verified
+
+        for name in unmatched:
+            trace.append(f"COMPARE {name}: no {plan.attribute} on record")
+            rows.append(row(name))
+            ans.unknown.append(f"{name}: no {label} is on record for this entity.")
+
+        ans.comparison = rows
+        missing = [r["entity"] for r in rows if not r["established"]]
+        if len(done) < 2:
+            why = f"the {label} could not be established for {', '.join(missing)}"
+            ans.answer = f"I cannot establish this comparison from the available evidence: {why}."
+            ans.abstained = True
+            ans.support_level = SupportLevel.INSUFFICIENT
+            ans.unknown.insert(0, f"A comparison needs at least two established values; {why}.")
+            trace.append(f"ABSTAIN comparison established={len(done)} missing={missing}")
+        else:
+            if change:
+                parts = [f"{r['entity']}: {r['answer']}" for r, _v in done]
+            else:
+                parts = [f"{r['entity']}: {r['value']} ({r['valid_from']} to {r['valid_to']}, "
+                         f"{r['source']}{', restated' if r['restated'] else ''})"
+                         + (" " + " ".join(r["citations"]) if r["citations"] else "")
+                         for r, _v in done]
+            text = (f"Comparing {label}" + (f" for {year}" if year else "") + " -- "
+                    + "; ".join(parts) + ".")
+            if not person and not change:
+                text += self._compare_amounts([r for r, _v in done])
+                starts = [v.valid_from for _r, v in done]
+                if (max(starts) - min(starts)).days > 31:
+                    text += (" The periods are not aligned: each figure covers that company's "
+                             "own fiscal year, so this compares fiscal years, not one "
+                             "calendar window.")
+            if missing:
+                text += f" Not established: {', '.join(missing)}."
+            ans.answer = text
+            ans.support_level = min((r["support_level"] for r, _v in done),
+                                    key=lambda lv: self._LEVEL_RANK.index(lv)
+                                    if lv in self._LEVEL_RANK else 0)
+            ans.coverage = min(coverage)
+            ans.evidence_score = min(scores)
+            trace.append(f"COMPARISON joined={len(done)} support={ans.support_level}")
+        trace.append(f"ELAPSED {time.time() - t0:.2f}s")
+        ans.trace = trace
+        return ans
+
+    @staticmethod
+    def _amount(value: str):
+        """(amount, unit) from a stored value like "-1.23 billion USD", else None."""
+        m = re.fullmatch(r"\s*(-?\d[\d,]*(?:\.\d+)?)\s*(thousand|million|billion)?\s*([A-Za-z]{3})?\s*",
+                         value or "")
+        if not m:
+            return None
+        scale = {"thousand": 1e3, "million": 1e6, "billion": 1e9}.get((m.group(2) or "").lower(), 1.0)
+        return float(m.group(1).replace(",", "")) * scale, (m.group(3) or "").upper()
+
+    @classmethod
+    def _compare_amounts(cls, rows) -> str:
+        """The spread between the highest and lowest figure, labelled as derived."""
+        amounts = [(cls._amount(r["value"]), r["entity"]) for r in rows]
+        if any(a is None for a, _e in amounts) or len({a[1] for a, _e in amounts}) != 1:
+            return ""   # a non-numeric value or mixed units: no arithmetic across them
+        unit = amounts[0][0][1]
+        ranked = sorted(((a[0], e) for a, e in amounts), key=lambda t: -t[0])
+        (hi, top), (lo, bottom) = ranked[0], ranked[-1]
+        if hi == lo:
+            return " The values are equal."
+        ratio = f" ({hi / lo:.2f}x)" if lo > 0 else ""
+        diff = hi - lo
+        for div, suf in ((1e9, "billion"), (1e6, "million"), (1e3, "thousand")):
+            if diff >= div:
+                spread = f"{diff / div:.2f} {suf} {unit}".strip()
+                break
+        else:
+            spread = f"{diff:,.0f} {unit}".strip()
+        return (f" {top} is higher than {bottom} by {spread}{ratio}; the difference is "
+                f"computed from the cited figures, not reported by either source.")
 
     def _doc_span(self, doc_id: str):
         md = self.metadata.get(doc_id)
@@ -500,9 +738,18 @@ _CORPORATE_SUFFIXES = frozenset(
 
 
 def _entity_overlap(subject: str, entity: str) -> bool:
-    """Token-overlap entity match: "Acme" matches "Acme Industries", but
-    "Helios Energy" does not match "Nova Logistics". Substring matching alone
-    would let a one-character company name match everything.
+    """Is a claim whose subject is `subject` about the asked `entity`?
+
+    Every distinctive token of the asked entity must appear in the subject:
+    "Microsoft" matches "Microsoft Corporation", "Acme" matches "Acme
+    Industries". This is the same containment rule `TemporalStore.canonical`
+    uses to resolve names, so the claim filter and the store agree.
+
+    It used to accept ANY shared token. "Quillon Robotics Qwkzmpd" -- a company
+    the corpus knows nothing about -- then shared "quillon" and "robotics" with
+    another company's filing, and the system answered with that company's CEO
+    at HIGH SUPPORT instead of abstaining. The same rule would answer a question
+    about "Apple Hospitality" with Apple Inc.'s facts.
 
     Corporate suffixes carry no identity: "Uber Technologies Inc." shares only
     "Inc" with "Apple Inc", and counting it put Uber's revenue into an answer
@@ -512,4 +759,4 @@ def _entity_overlap(subject: str, entity: str) -> bool:
                 if len(w) > 2 and w not in _CORPORATE_SUFFIXES}
 
     a, b = toks(subject), toks(entity)
-    return bool(a & b) if (a and b) else subject in entity or entity in subject
+    return b <= a if (a and b) else subject in entity or entity in subject

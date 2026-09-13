@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -69,10 +70,37 @@ def main() -> int:
         check(lvl, f"{f} present", (ROOT / f).exists())
 
     try:
-        json.load((ROOT / "frontend" / "vercel.json").open(encoding="utf-8"))
+        vercel = json.load((ROOT / "frontend" / "vercel.json").open(encoding="utf-8"))
         check(WARN, "vercel.json parses", True)
+        check(BLOCK, "Vercel build writes config.js",
+              "build-config.mjs" in str(vercel.get("buildCommand", ""))
+              and (ROOT / "frontend" / "build-config.mjs").exists(),
+              "without it the deployed page calls itself instead of the API")
     except Exception as exc:  # noqa: BLE001
         check(WARN, "vercel.json parses", False, str(exc)[:60])
+
+    # ---- things that broke real deploys of this repo ------------------------
+    page = (ROOT / "frontend" / "index.html").read_text(encoding="utf-8")
+    check(BLOCK, "frontend loads config.js", 'src="config.js"' in page,
+          "window.VERITAS_API is never set on a static host")
+    check(BLOCK, "served UI matches frontend/",
+          (ROOT / "api" / "static" / "index.html").read_text(encoding="utf-8") == page,
+          "cp frontend/index.html api/static/index.html")
+    dockerfile = (ROOT / "docker" / "Dockerfile.api").read_text(encoding="utf-8")
+    for needed in ("checkpoints/tokenizer.json", "checkpoints/sft.pt", "data/real"):
+        check(BLOCK, f"image bakes {needed}", needed in dockerfile and (ROOT / needed).exists(),
+              "a Fly machine has nothing mounted; the API would boot without it")
+    ignore = (ROOT / ".dockerignore").read_text(encoding="utf-8") if (ROOT / ".dockerignore").exists() else ""
+    check(WARN, ".dockerignore excludes training checkpoints", "checkpoints/last.pt" in ignore,
+          "otherwise every deploy uploads ~280 MB of unused weights")
+    check(BLOCK, "requirements-api.txt present", (ROOT / "requirements-api.txt").exists())
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    check(BLOCK, "Kafka image is pullable",
+          not re.search(r"^\s*image:\s*bitnami/kafka", compose, re.M),
+          "bitnami/kafka was withdrawn from Docker Hub's free tier")
+    fly = (ROOT / "fly.toml").read_text(encoding="utf-8")
+    check(WARN, "fly.toml has no empty data volume", "[[mounts]]" not in fly,
+          "a new volume is empty; the image's seed data covers it, but it must be created first")
 
     check(BLOCK, ".env not committed", not (ROOT / ".env").exists()
           or ".env" in (ROOT / ".gitignore").read_text(encoding="utf-8"),

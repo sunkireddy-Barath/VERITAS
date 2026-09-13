@@ -64,8 +64,18 @@ def human(v: float) -> str:
 
 
 def load_truth() -> list[dict]:
+    """The filings, with the loader's tag priority applied.
+
+    A 10-K can report one period under two revenue tags (total vs a subset).
+    Truth must follow the same rule as the loader, or the key picks a winner
+    arbitrarily and scores a correct total as wrong.
+    """
+    sys.path.insert(0, str(ROOT))
+    from veritas.ingest.real_sources import _prefer_primary_tags
+
     p = ROOT / "data" / "real" / "sec_facts.jsonl"
-    return [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+    rows = [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+    return _prefer_primary_tags(rows)
 
 
 # ============================================================ SUITE A
@@ -152,6 +162,9 @@ def suite_hallucination(rows):
         ("opinion",           "Should I buy Apple stock?"),
         ("nonsense",          "What is Tesla number of unicorns?"),
         ("causal, no evidence", "Why did Apple Inc revenue increase in 2021?"),
+        # one side is real, one is not: answering half a comparison is a leak
+        ("comparison, one side absent",
+         "Compare Apple Inc and Zorblax Corporation revenue in 2023"),
     ]
     clean = leaked = 0
     for kind, q in probes:
@@ -205,11 +218,14 @@ def suite_features(rows):
            and not c.get("abstained"),
            "closed fiscal period reported as last-known, not as current")
 
-    # 3. real restatement surfaced as a conflict
+    # 3. a real restatement is a correction: restated figure, original named
     d = ask("What was Apple Inc net income in 2008?")
-    record("3. Real restatement detected",
-           d.get("support_level") == "CONFLICTED" or bool(d.get("conflicts")),
-           "SEC filed FY2008 net income twice with different values")
+    ansd = d.get("answer") or ""
+    record("3. Real restatement reported as a correction",
+           "6.12" in ansd and "originally reported as 4.83" in ansd
+           and "disagree" not in ansd.lower()
+           and any(t.get("superseded_at") for t in d.get("timeline", [])),
+           "SEC filed FY2008 net income as 4.83B, restated to 6.12B on 2010-01-25")
 
     # 4. abstention
     e = ask("What is Apple Inc headcount?")
@@ -254,17 +270,28 @@ def suite_features(rows):
            "'Apple' resolves to the stored 'Apple Inc.'")
 
     # 12. live ingestion changes the answer without retraining
+    #
+    # A fresh, letters-only company name per run: a fixed name is already in the
+    # store on any rerun (and a digit-led suffix is dropped by the planner), so
+    # "before" would not abstain and the check would prove nothing. The API key
+    # is sent because a deployed API protects /ingest.
+    company = "Vertex Dynamics " + "".join(
+        random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(7)).capitalize()
+    key = os.environ.get("VERITAS_API_KEY", "")
+    secrets_file = ROOT / ".deploy" / "secrets.json"
+    if not key and secrets_file.exists():
+        key = json.loads(secrets_file.read_text(encoding="utf-8")).get("VERITAS_API_KEY", "")
     try:
-        before = ask("What is Vertex Dynamics status?")
+        before = ask(f"What is {company} status?")
         req = urllib.request.Request(
             f"{API}/ingest",
-            data=json.dumps({"source_id": "sec.gov", "entity": "Vertex Dynamics",
+            data=json.dumps({"source_id": "sec.gov", "entity": company,
                              "published": "2026-09-10", "tier": 1,
-                             "text": "Vertex Dynamics filing: the Denver facility "
+                             "text": f"{company} filing: the Denver facility "
                                      "is now operational as of September 2026."}).encode(),
-            headers={"Content-Type": "application/json"})
+            headers={"Content-Type": "application/json", **({"X-API-Key": key} if key else {})})
         ing = json.load(urllib.request.urlopen(req, timeout=60))
-        after = ask("What is Vertex Dynamics status?")
+        after = ask(f"What is {company} status?")
         record("12. Live ingestion, no retraining",
                before.get("abstained") and not after.get("abstained")
                and not ing.get("retrain_required"),
@@ -279,6 +306,42 @@ def suite_features(rows):
            st["graph"]["nodes"] > 100 and st["graph"]["edges"] > 100,
            f"{st['graph']['nodes']} nodes, {st['graph']['edges']} edges, "
            f"{st['entity_count']} entities, {st['fact_versions']} versions")
+
+    # 14. transaction-time travel: what was believed before the restatement
+    try:
+        path = "/entity/Apple%20Inc./as_of?attribute=net_income&valid=2008-06-01"
+        then = get(path + "&known=2009-12-01")
+        now = get(path)
+        record("14. Bitemporal time travel (as believed on a date)",
+               (then.get("value") or "").startswith("4.83")
+               and (now.get("value") or "").startswith("6.12")
+               and len(now.get("belief_history", [])) >= 2,
+               f"believed 2009-12-01: {then.get('value')}; believed now: {now.get('value')}")
+    except urllib.error.HTTPError as exc:
+        record("14. Bitemporal time travel (as believed on a date)", False, f"HTTP {exc.code}")
+
+    # 15. change feed: restatements and successions are recorded events
+    try:
+        corrected = get("/changes?kind=CORRECTED&entity=Apple%20Inc.&limit=50")
+        changed = get("/changes?kind=CHANGED&entity=Apple%20Inc.&limit=50")
+        record("15. World change feed",
+               any(c["attribute"] == "net_income" and c["new_value"].startswith("6.12")
+                   for c in corrected["changes"])
+               and any(c["attribute"] == "ceo" for c in changed["changes"]),
+               f"Apple: {corrected['total']} restatements, {changed['total']} state changes")
+    except urllib.error.HTTPError as exc:
+        record("15. World change feed", False, f"HTTP {exc.code}")
+
+    # 16. comparison keeps each side's own period and labels the arithmetic
+    h = ask("Compare Apple Inc and Microsoft revenue in 2023")
+    ansh = h.get("answer") or ""
+    rows = h.get("comparison", [])
+    record("16. Period-aware comparison",
+           "383.29" in ansh and "211.91" in ansh and "not aligned" in ansh
+           and "not reported by either source" in ansh
+           and len(rows) == 2 and all(r.get("established") for r in rows),
+           f"{len(rows)} sides, {len(h.get('citations', []))} citations, "
+           f"support={h.get('support_level')}")
 
     passed = sum(p for _, p, _ in results)
     print(f"\n  {passed}/{len(results)} features verified")

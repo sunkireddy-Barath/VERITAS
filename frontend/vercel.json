@@ -1,5 +1,9 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "",
+  "buildCommand": "node build-config.mjs",
+  "outputDirectory": ".",
   "cleanUrls": true,
   "trailingSlash": false,
   "rewrites": [
@@ -16,6 +20,12 @@
           "key": "Permissions-Policy",
           "value": "microphone=(self), camera=(), geolocation=()"
         }
+      ]
+    },
+    {
+      "source": "/(index.html|config.js)?",
+      "headers": [
+        { "key": "Cache-Control", "value": "no-cache" }
       ]
     }
   ]

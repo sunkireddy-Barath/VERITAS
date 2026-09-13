@@ -2,118 +2,194 @@
 
 ## The one constraint that decides the topology
 
-VERITAS holds a PyTorch model, a vector index, a BM25 index and a bitemporal
-store **in memory**, and loads them once at startup (~20–30 s). It is a
-**stateful, long-lived process**.
+VERITAS holds a PyTorch model, a vector index, a BM25 index, a bitemporal store
+and an evidence graph **in memory**, and builds them once at startup: ~10–35 s
+on a GPU, and minutes on CPU, where embedding every chunk dominates (382 s
+measured on a loaded machine). It is a **stateful, long-lived process**, and
+every health-check grace period in this repo is 600 s to cover the CPU case.
 
-That rules out putting the backend on Vercel, Netlify Functions or Lambda:
-serverless has no GPU, a bundle-size cap in the hundreds of MB, and pays the
-30-second load on every cold start. So:
+That rules out Vercel, Netlify Functions or Lambda for the backend: serverless
+has no GPU, a bundle cap in the hundreds of MB, and would pay the startup on
+every cold start. So:
 
 ```
-   Browser ── Vercel (static React) ──HTTPS──▶ Container host (FastAPI + model)
-                                                    │
-                                    ┌───────────────┼───────────────┐
-                                Postgres          Redis           Kafka
-                            (tstzrange+pgvector) (cache)      (optional bus)
+Browser ── Vercel (static page + config.js) ──HTTPS──▶ Fly.io machine (FastAPI + model + UI)
+                                                           ▲
+                                  feed poller ──▶ Kafka ───┘  (optional; the API consumes it)
 ```
 
-| component | where | why |
+| component | where | notes |
 |---|---|---|
-| frontend | Vercel / Cloudflare Pages | static, global CDN, free tier is enough |
-| API + model | Fly.io, Railway, Render, or a VM | needs persistent memory, ideally a GPU |
-| Postgres | Neon, Supabase, RDS | `tstzrange` + GiST + `pgvector` |
-| Redis | Upstash, ElastiCache | answer cache only — losing it costs latency, never correctness |
-| Kafka | Redpanda Cloud, Confluent, self-hosted | optional; the bus falls back in-process |
+| frontend | Vercel (or any static host) | `build-config.mjs` writes the API URL into `config.js` |
+| API + model | Fly.io (or Railway, Render, a VM) | image bakes the serving checkpoint and seed data |
+| Kafka | local: `docker compose --profile kafka`; hosted: Confluent / Redpanda / Aiven | optional |
+| Postgres, Redis | **not used yet** | `docker/initdb/01_schema.sql` is the target schema only |
+
+Run `python scripts/preflight.py` before any deploy. It blocks on the failures
+that actually broke this repo's deploys: an image without the checkpoint, a
+page that never loads `config.js`, an unpullable Kafka image.
 
 ---
 
-## 1. Local — everything in Docker
+## 1. Local
+
+Without Docker:
 
 ```bash
-cp .env.example .env            # set POSTGRES_PASSWORD
-docker compose up -d            # API + Postgres + Redis
-curl localhost:8000/health      # {"ready":true,...}
-open http://localhost:8000
+python run_veritas.py              # API + UI on http://localhost:8000
 ```
 
-With the streaming pipeline:
+With Docker:
 
 ```bash
-docker compose --profile kafka up -d
-docker compose logs -f worker-ingest
+docker compose up -d --build       # the same, in a container
+make kafka                         # + Kafka broker + feed poller
+make kafka-smoke                   # proves a Kafka message changes an answer
 ```
 
-Kafka sits behind a profile because the system is **correct without it** —
-`make_bus()` returns an in-process queue when `VERITAS_KAFKA_BOOTSTRAP` is
-unset. Turn it on when you want a replayable ingestion log and independent
-scaling of the embedding stage.
+### How Kafka is wired, and why this way
 
-Prerequisite either way: `checkpoints/tokenizer.json` and a `.pt` file, i.e.
-run notebooks 01–04 first. The compose file mounts `./checkpoints` read-only
-rather than baking weights into the image, so you can swap a model without a
-rebuild.
+The knowledge base lives in the API process's memory, so **the API is the
+consumer**. With `VERITAS_KAFKA_BOOTSTRAP` set it starts a background thread
+that drains `veritas.raw` → change detection → `veritas.changed` → chunk, embed,
+index, assert facts → `veritas.changes`, holding the same lock as request
+handlers. A separate consumer container would build its own private knowledge
+base that no question can reach; the first version of this stack did exactly
+that, and nothing that went through Kafka ever appeared in an answer.
+
+| process | role | replicas |
+|---|---|---|
+| `api` | serves questions **and** consumes the log | one per knowledge-base copy |
+| `worker-poller` | fetches the monitored feeds, publishes to `veritas.raw`; loads no model | exactly one |
+
+* Every API boot joins a **new** consumer group (`veritas-api-<hostname>-<random>`),
+  so it has no committed offsets and reads from the earliest retained message:
+  a restarted replica **replays the log** and rebuilds its store — that is what
+  the 7-day retention is for. A fixed group name would resume after the last
+  committed offset and silently lose everything consumed before the restart.
+  Setting `VERITAS_KAFKA_GROUP` opts into resume-from-offset.
+* `/ingest` still answers synchronously and also writes the document to
+  `veritas.raw`, so a replay includes it. The replica's own consumer sees the
+  text again and change detection suppresses it: idempotent, not a double ingest.
+* `/health` reports `bus.kind`: `none` (no broker configured), `kafka`
+  (consuming), or `unavailable` (configured but unreachable after two minutes
+  of retries) — a deploy must not mistake the last for a working pipeline.
+  `/stats` adds per-topic counters, suppressed duplicates and handler errors.
+
+Two settings are correctness requirements, not tuning:
+
+* **Partition by entity.** `TemporalStore.assert_fact` classifies an assertion
+  against what it already holds, so out-of-order delivery turns a succession
+  into a spurious `CONFLICT`. Messages are keyed by entity for per-entity order.
+* **Commit after the handler.** A crash mid-handler redelivers the message;
+  redelivery lands as `REAFFIRMED` or is suppressed by change detection.
+
+The Compose broker is the official `apache/kafka` image in KRaft mode (no
+ZooKeeper). `bitnami/kafka` was withdrawn from Docker Hub's free tier in 2025.
 
 ---
 
-## 2. Backend — Fly.io (recommended)
+## 2. Free public link — Cloudflare quick tunnel from your own machine
 
-Fly gives persistent machines, a real filesystem, and optional GPUs, which is
-exactly the shape of this workload.
+The only hosting in this guide that costs nothing and needs no account or card.
+The app runs where it already runs (your GPU), and Cloudflare gives it a public
+HTTPS URL. It is online only while the machine and the tunnel are running, and
+the URL changes each time the tunnel restarts.
 
 ```bash
-fly launch --no-deploy --name veritas-api
-fly volumes create veritas_data --size 10 --region iad
-fly secrets set POSTGRES_PASSWORD=... VERITAS_DATABASE_URL=postgres://...
-fly deploy
+# 1. the app, bound to localhost only, with writes protected
+export VERITAS_API_KEY=$(python -c "import secrets;print(secrets.token_urlsafe(24))")
+export VERITAS_TRUST_PROXY=1          # safe: only the local tunnel can reach 127.0.0.1
+python -m uvicorn api.main:app --host 127.0.0.1 --port 8000
+
+# 2. the tunnel (download cloudflared from github.com/cloudflare/cloudflared/releases)
+cloudflared tunnel --url http://127.0.0.1:8000    # prints https://<words>.trycloudflare.com
+
+# 3. prove it works over the real network path
+python scripts/e2e_public.py https://<words>.trycloudflare.com
 ```
 
-`fly.toml`:
+`scripts/e2e_public.py` checks the UI, every read endpoint, SSE streaming through
+the proxy, API-key enforcement, CORS, input validation, refusals and live
+ingestion. Keep `VERITAS_API_KEY` set: the link is public, and without a key
+anyone could write to the knowledge base.
 
-```toml
-app = "veritas-api"
-primary_region = "iad"
+---
 
-[build]
-  dockerfile = "docker/Dockerfile.api"
+## 2b. Backend — Hugging Face Spaces (Docker; needs HF PRO)
 
-[env]
-  VERITAS_DEVICE = "cpu"          # "cuda" on a GPU machine
+A Docker Space on `cpu-basic` runs the container with 16 GB of RAM over HTTPS,
+which fits the model and the in-memory indices. **As of September 2026 Hugging
+Face requires a PRO subscription for Docker and Gradio Spaces on cpu-basic**;
+creating one on a free account returns `402 Payment Required`. (Static Spaces
+stay free, but this backend is not static.) Free web tiers that cap memory near
+512 MB cannot hold PyTorch plus the store, and a 0.1-vCPU instance would take
+far longer than any health check allows to embed the corpus at boot.
 
-[[mounts]]
-  source = "veritas_data"
-  destination = "/app/data"
-
-[http_service]
-  internal_port = 8000
-  force_https = true
-  auto_stop_machines = false      # NEVER auto-stop: a stop costs a 30s reload
-  min_machines_running = 1
-
-  [http_service.concurrency]
-    type = "requests"
-    soft_limit = 20
-    hard_limit = 40
-
-[[vm]]
-  memory = "4gb"                  # model + indices; 8gb once the corpus grows
-  cpu_kind = "shared"
-  cpus = 2
-
-[checks.health]
-  type = "http"
-  path = "/health"
-  interval = "30s"
-  timeout = "10s"
-  grace_period = "90s"            # must exceed model load time
+```bash
+# token with WRITE access: https://huggingface.co/settings/tokens
+export HF_TOKEN=hf_...
+python scripts/deploy_hf_space.py --space <hf-user>/veritas --dry-run    # see what uploads
+python scripts/deploy_hf_space.py --space <hf-user>/veritas              # create, upload, wait for /health
+# -> https://<hf-user>-veritas.hf.space  (API + UI)
 ```
 
-**`auto_stop_machines = false` matters.** Scale-to-zero is the default on most
-platforms and it is wrong here: every cold start reloads the model and re-indexes
-the corpus, so the first user after an idle period waits 30 seconds.
+The script stages exactly what `Dockerfile.api` copies (code, `tokenizer.json`,
+`sft.pt`, `data/real`, ~58 MB), uses that Dockerfile unchanged, sets
+`VERITAS_DEVICE=cpu`, `VERITAS_TRUST_PROXY=1` and the CORS origins as Space
+variables, stores a generated `VERITAS_API_KEY` as a Space secret (and in
+`.deploy/secrets.json`, git-ignored), then follows the build until `/health`
+reports ready. The container runs as UID 1000, which Spaces require.
 
-Railway/Render equivalents: set a health-check grace period ≥ 90 s, disable
-scale-to-zero, attach a volume at `/app/data`.
+After deploying the frontend, allow its origin:
+
+```bash
+python scripts/deploy_hf_space.py --space <hf-user>/veritas \
+  --allow-origin https://<project>.vercel.app --config-only
+```
+
+---
+
+## 2c. Backend, paid — Fly.io
+
+```bash
+# once
+fly auth login
+fly launch --copy-config --no-deploy --name <unique-app-name>
+fly secrets set VERITAS_API_KEY=$(python -c "import secrets;print(secrets.token_urlsafe(24))")
+
+# every deploy
+python scripts/preflight.py
+fly deploy --remote-only                     # builds on Fly's builders; no local Docker needed
+curl https://<unique-app-name>.fly.dev/health
+```
+
+What `fly.toml` and the image guarantee:
+
+* **The image is self-contained.** `Dockerfile.api` copies `checkpoints/tokenizer.json`,
+  `checkpoints/sft.pt` and `data/real/` in. `.dockerignore` keeps the other
+  training checkpoints and the raw corpus out of the upload. The build context is
+  your local directory, so run `fly deploy` from a checkout that has the
+  checkpoints (they are git-ignored and not on GitHub).
+* **No volume.** The store is rebuilt in memory at boot, and the API falls back to
+  the baked `seed/real` data if `data/real` is empty.
+* **Never scale to zero** (`auto_stop_machines = "off"`, `min_machines_running = 1`):
+  a stopped machine costs the next user a full model load.
+* **Health grace period 120 s**, longer than a CPU boot.
+* `VERITAS_TRUST_PROXY=1` so the rate limiter sees the real client behind Fly's edge.
+* CPU torch is installed from PyTorch's CPU index into a virtualenv; installing
+  it with `pip --prefix` would pull the 2.5 GB CUDA build instead.
+
+Kafka on Fly — point the API at a managed cluster:
+
+```bash
+fly secrets set VERITAS_KAFKA_BOOTSTRAP=<host:9092> \
+  VERITAS_KAFKA_SECURITY_PROTOCOL=SASL_SSL VERITAS_KAFKA_SASL_MECHANISM=SCRAM-SHA-256 \
+  VERITAS_KAFKA_USERNAME=<user> VERITAS_KAFKA_PASSWORD=<password>
+```
+
+Run the poller as a second Fly app from the same image with
+`python -m scripts.run_worker --poll`, and exactly one machine.
 
 ---
 
@@ -121,132 +197,64 @@ scale-to-zero, attach a volume at `/app/data`.
 
 ```bash
 cd frontend
-echo 'window.VERITAS_API="https://veritas-api.fly.dev";' > config.js
-vercel --prod
+vercel link                                        # once
+vercel env add VERITAS_API_URL production          # https://<unique-app-name>.fly.dev
+vercel deploy --prod
 ```
 
-Add `<script src="/config.js"></script>` before the React bundle in
-`index.html`. The page reads `window.VERITAS_API` and falls back to
-same-origin, so the identical file works locally behind FastAPI and on Vercel
-with a remote backend.
+`vercel.json` runs `node build-config.mjs`, which writes `config.js` from
+`VERITAS_API_URL` and **fails the build** for a non-HTTPS URL (an HTTPS page
+cannot call an HTTP API). `index.html` loads `config.js`; served by FastAPI, the
+same file comes from the `/config.js` route with an empty value (same origin).
 
-Then lock CORS down — the dev default is `allow_origins=["*"]`:
-
-```python
-# api/main.py
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[os.environ.get("VERITAS_ALLOWED_ORIGIN", "http://localhost:8000")],
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
-)
-```
-
-**Voice needs HTTPS.** The Web Speech API is blocked on plain HTTP except on
-`localhost`. Vercel gives you TLS automatically; a self-hosted frontend needs a
-certificate or the microphone button silently does nothing.
-
----
-
-## 4. Postgres
+Then allow the Vercel origin on the backend, or the browser blocks every call:
 
 ```bash
-psql "$VERITAS_DATABASE_URL" -f docker/initdb/01_schema.sql
+fly secrets set VERITAS_ALLOWED_ORIGIN=https://<project>.vercel.app
 ```
 
-The schema is where the bitemporal design becomes a database guarantee rather
-than a convention:
-
-* `valid_range TSTZRANGE` + a GiST index — the as-of query
-  (`valid_range @> $t`) is an index scan, not a table scan.
-* `EXCLUDE USING gist (entity =, attribute =, source_id =, valid_range &&)` —
-  one source physically cannot assert two overlapping values for the same fact.
-  Application code can be bypassed; a constraint cannot.
-* `pgvector` keeps embeddings beside the facts they came from, so retrieval and
-  provenance stay in one transaction and cannot drift apart.
-
-Build the IVFFlat index **after** the bulk load — it needs data to choose
-sensible centroids:
-
-```sql
-CREATE INDEX chunk_embedding_ivf ON chunk
-  USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
-ANALYZE chunk;
-```
-
-Managed options: **Neon** (branching is genuinely useful for testing a
-migration against production data), **Supabase** (pgvector preinstalled).
+**Voice needs HTTPS.** Vercel and Fly both provide it.
 
 ---
 
-## 5. Kafka — when and why
+## 4. Postgres and Redis — not wired yet
 
-Turn it on when any of these is true:
+No code reads `VERITAS_DATABASE_URL` or `VERITAS_REDIS_URL`; earlier versions of
+the Compose file started both services anyway. They are out of the stack until
+the store has a Postgres backend. `docker/initdb/01_schema.sql` is the design
+for it:
 
-* more than ~50 monitored sources, so one slow fetch stalls the cycle;
-* you need to **replay** ingestion — rebuilding the store from the raw log is
-  the ingestion-side counterpart of the append-only evidence guarantee;
-* embedding throughput needs more than one machine.
-
-```
-veritas.raw     ──▶ change detection  (most messages die here)
-veritas.changed ──▶ chunk + embed + index   ← scale this consumer group
-veritas.facts   ──▶ bitemporal assert + graph + cache invalidation
-veritas.changes ──▶ notifications, dashboards
-```
-
-Two settings are correctness requirements, not tuning:
-
-* **Partition by entity.** `TemporalStore.assert_fact` classifies an assertion
-  by comparing it with what it already holds, so out-of-order delivery turns a
-  real succession into a spurious `CONFLICT`. Keying by entity gives per-entity
-  ordering.
-* **Manual commit after the handler.** With auto-commit, a crash mid-handler
-  loses the message. Re-delivery is safe — a repeat lands as `REAFFIRMED` —
-  so at-least-once is the right trade.
-
-```bash
-kafka-topics.sh --create --topic veritas.raw --partitions 6 \
-  --config retention.ms=604800000 --bootstrap-server $BOOTSTRAP
-```
-
-Six partitions caps useful parallelism at six consumers; size it to your
-expected entity count, not your current one — repartitioning later reshuffles
-keys and breaks ordering guarantees during the migration.
-
-Managed: **Redpanda Cloud** (Kafka-compatible, no ZooKeeper, cheaper at this
-scale) or **Confluent Cloud**.
+* `valid_range TSTZRANGE` + GiST index — the as-of query is an index scan.
+* `EXCLUDE USING gist (entity =, attribute =, source_id =, valid_range &&)` — one
+  source cannot assert overlapping values for the same fact.
+* `pgvector` beside the facts, so retrieval and provenance share a transaction.
 
 ---
 
-## 6. Before you call it production
+## 5. Before you call it production
 
 | item | status | action |
 |---|---|---|
-| Auth | ❌ none | API keys or OAuth on `/ask`, `/ingest` |
-| Rate limiting | ❌ none | `slowapi` or the platform's limiter |
-| CORS | ⚠️ `*` | pin to the frontend origin |
-| Secrets | ✅ env vars | never commit `.env` |
-| Persistence | ⚠️ in-memory | run the Postgres migration |
-| Observability | ⚠️ logs only | `/metrics` + Prometheus |
-| Backups | ❌ | `pg_dump` on a schedule; the store is the system of record |
+| Auth on writes | ✅ `VERITAS_API_KEY` | set it as a Fly secret |
+| Rate limiting | ✅ per-client, in-process | Redis or the edge limiter beyond one replica |
+| CORS | ✅ pinned by env | add the Vercel origin |
+| Secrets | ✅ env / `fly secrets` | never commit `.env` |
+| Persistence | ⚠️ in memory; Kafka replay rebuilds ingested docs | Postgres backend for the store |
+| Observability | ⚠️ `/health`, `/stats`, logs | `/metrics` + Prometheus |
 | HTTPS | ✅ via platform | required for voice |
 
-**Domain metrics matter more than latency here.** Export evidence coverage,
-abstention rate, freshness lag, conflicts detected per day and ingest queue
-depth. p99 latency tells you nothing about whether answers are still
-well-evidenced — a system can get faster and quietly stop citing anything.
+Domain metrics matter more than latency: evidence coverage, abstention rate,
+freshness lag, conflicts per day, consumer errors. A system can get faster and
+quietly stop citing anything.
 
 ---
 
-## 7. Cost, roughly
+## 6. Cost, roughly
 
 | tier | setup | ~monthly |
 |---|---|---|
-| demo | Fly shared-1x 2 GB + Neon free + Vercel free | ~$5 |
-| small prod | Fly 4 GB + Neon Launch + Upstash | ~$50 |
-| with Kafka | + Redpanda Serverless + 2 workers | ~$150 |
-| GPU | Fly A10 (`a10` machine) | ~$1.50/hr while running |
+| demo | Fly shared-cpu 2x / 4 GB + Vercel free | ~$25 |
+| with Kafka | + managed Kafka (smallest tier) + poller machine | ~$50–100 |
+| GPU | Fly GPU machine | billed per hour while running |
 
-CPU inference is fine for the 14M-parameter model — GPU only becomes worthwhile
-once you scale the model up or need to re-embed a large corpus frequently.
+CPU inference is fine for the 14M-parameter model.

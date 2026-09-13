@@ -1,38 +1,56 @@
-# VERITAS API — CPU image. For GPU, swap the base for
-# nvidia/cuda:12.4-runtime-ubuntu22.04 and install the cu124 torch wheel.
+# VERITAS API -- CPU image, self-contained: code, the serving checkpoint and a
+# seed copy of the real data are baked in, so the container boots ready on any
+# host (Fly.io, Railway, a VM) with nothing mounted. Compose still mounts
+# ./checkpoints and ./data over them for local development.
+#
+# For a GPU host, swap the base for nvidia/cuda:12.4.1-runtime-ubuntu22.04 and
+# the torch index for https://download.pytorch.org/whl/cu124.
 FROM python:3.12-slim AS base
 
-# Build deps only in the builder layer, so the runtime image stays small.
 FROM base AS builder
-WORKDIR /build
-RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ \
-    && rm -rf /var/lib/apt/lists/*
-COPY requirements.txt .
-# CPU torch wheel: ~200MB instead of ~2.5GB with bundled CUDA.
-RUN pip install --no-cache-dir --prefix=/install \
-      --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+# A virtualenv, not `pip --prefix`: installing torch from the CPU index and
+# the rest from PyPI in two steps only works if the second step can SEE the
+# first. With --prefix it cannot, and pulls the ~2.5 GB CUDA build of torch.
+RUN python -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch
+COPY requirements-api.txt /tmp/requirements-api.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-api.txt
 
 FROM base AS runtime
 WORKDIR /app
-COPY --from=builder /install /usr/local
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    VERITAS_DEVICE=cpu
+
 COPY veritas/ ./veritas/
 COPY api/ ./api/
 COPY scripts/ ./scripts/
 COPY run_veritas.py ./
 
-# Non-root: the container fetches from the public internet, so it should not
-# run as root.
-RUN useradd -m -u 10001 veritas \
-    && mkdir -p /app/checkpoints /app/data/real /app/data/raw \
+# The serving model. Only these two files are read at runtime; the other
+# training checkpoints are excluded by .dockerignore.
+COPY checkpoints/tokenizer.json checkpoints/sft.pt ./checkpoints/
+# Seed data. The API reads data/real when present (a mount, a refreshed fetch)
+# and falls back to this copy, so an empty volume can never boot an empty system.
+COPY data/real/ ./seed/real/
+
+# Non-root: the container fetches from the public internet. UID 1000 because
+# Hugging Face Spaces runs every container as that user; any other UID would
+# own /app while the process runs as someone else.
+RUN useradd -m -u 1000 veritas \
+    && mkdir -p /app/data/real /app/data/raw \
     && chown -R veritas:veritas /app
 USER veritas
 
-ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 EXPOSE 8000
 
-# The model + real data load at startup (~20-30s), so the probe must allow for
-# it or the orchestrator will kill the container in a restart loop.
-HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
+# Startup loads the model and embeds every chunk. On a GPU that is ~10 s; on
+# CPU it measured 382 s under load. The start period must cover the CPU case or
+# the orchestrator kills the container in a restart loop.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=3 \
   CMD python -c "import urllib.request,json,sys; \
       d=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=5)); \
       sys.exit(0 if d.get('ready') else 1)"

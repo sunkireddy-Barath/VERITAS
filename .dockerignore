@@ -1,0 +1,32 @@
+# The build context is what `docker build` / `fly deploy` uploads. Keep it to
+# what the image needs: code, the serving checkpoint, and the small real data.
+.git
+.github
+.vscode
+.idea
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ipynb_checkpoints
+.env
+.env.*
+!.env.example
+
+notebooks/
+docs/
+tests/
+
+# Training artifacts: only tokenizer.json and sft.pt are served.
+checkpoints/last.pt
+checkpoints/final.pt
+checkpoints/best.pt
+checkpoints/*.bin
+
+# Pretraining corpus and shards (GBs, not needed to serve).
+data/raw/
+data/processed/
+
+frontend/node_modules/
+
+# Deploy staging copies the checkpoint; never send it twice.
+.deploy/

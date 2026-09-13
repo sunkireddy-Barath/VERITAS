@@ -1,124 +1,79 @@
-# VERITAS full stack.
+# VERITAS local stack.
 #
-#   docker compose up -d                 API + Postgres + Redis
-#   docker compose --profile kafka up -d adds Kafka + the ingestion workers
+#   docker compose up -d --build                    API + UI on http://localhost:8000
+#   make kafka                                      + Kafka broker + feed poller
+#     (= VERITAS_KAFKA_BOOTSTRAP=kafka:9092 docker compose --profile kafka up -d --build)
 #
-# Kafka is behind a profile because the system runs correctly without it
-# (`make_bus` falls back to an in-process queue). Turn it on when you need a
-# replayable ingestion log and horizontal scaling of the embedding stage.
+# The API holds the knowledge base in memory, so the API is also the Kafka
+# consumer: with VERITAS_KAFKA_BOOTSTRAP set it drains veritas.raw in a
+# background thread and every polled document reaches the answers. There is no
+# separate ingest-consumer container -- one would build a private knowledge
+# base that no question can see.
+#
+# Postgres and Redis are not in this stack: no code reads them yet.
+# docker/initdb/01_schema.sql is the target bitemporal schema (see
+# docs/DEPLOYMENT.md), not a running dependency.
 
 services:
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: veritas
-      POSTGRES_USER: veritas
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-veritas_dev}
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
-    ports: ["5432:5432"]
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U veritas -d veritas"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  redis:
-    image: redis:7-alpine
-    # Answer cache only: losing it costs latency, never correctness, so
-    # persistence is deliberately off.
-    command: redis-server --save "" --appendonly no --maxmemory 512mb --maxmemory-policy allkeys-lru
-    ports: ["6379:6379"]
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-
   api:
     build:
       context: .
       dockerfile: docker/Dockerfile.api
     image: veritas-api:latest
     environment:
-      VERITAS_DATABASE_URL: postgresql://veritas:${POSTGRES_PASSWORD:-veritas_dev}@postgres:5432/veritas
-      VERITAS_REDIS_URL: redis://redis:6379/0
-      VERITAS_KAFKA_BOOTSTRAP: ${VERITAS_KAFKA_BOOTSTRAP:-}
       VERITAS_DEVICE: ${VERITAS_DEVICE:-cpu}
+      VERITAS_KAFKA_BOOTSTRAP: ${VERITAS_KAFKA_BOOTSTRAP:-}
+      VERITAS_API_KEY: ${VERITAS_API_KEY:-}
+      VERITAS_ALLOWED_ORIGIN: ${VERITAS_ALLOWED_ORIGIN:-http://localhost:8000,http://127.0.0.1:8000,http://localhost:3000}
+      VERITAS_RATE_LIMIT_PER_MIN: ${VERITAS_RATE_LIMIT_PER_MIN:-60}
     volumes:
-      # Checkpoints and fetched data are mounted, not baked: the image stays
-      # small and reproducible, and you can swap a model without a rebuild.
+      # Mounted over the baked copies, so a retrained model or a fresh data
+      # fetch is picked up with a restart instead of a rebuild.
       - ./checkpoints:/app/checkpoints:ro
       - ./data:/app/data
     ports: ["8000:8000"]
-    depends_on:
-      postgres: {condition: service_healthy}
-      redis: {condition: service_healthy}
     restart: unless-stopped
 
   # ---------------------------------------------------------------- kafka
   kafka:
-    image: bitnami/kafka:3.7
+    # The official Apache image. bitnami/kafka was withdrawn from Docker Hub's
+    # free tier in 2025, so the old tag no longer pulls.
+    image: apache/kafka:3.9.1
     profiles: ["kafka"]
     environment:
-      # KRaft mode: no ZooKeeper, one less moving part.
-      KAFKA_CFG_NODE_ID: "1"
-      KAFKA_CFG_PROCESS_ROLES: controller,broker
-      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
-      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
-      # Retain the raw log for a week: the knowledge base can be rebuilt from
-      # it, which is the ingestion-side counterpart of the append-only store.
-      KAFKA_CFG_LOG_RETENTION_HOURS: "168"
-      ALLOW_PLAINTEXT_LISTENER: "yes"
-    ports: ["9092:9092"]
-    volumes: [kafkadata:/bitnami/kafka]
+      # KRaft single node: no ZooKeeper.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:29092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Six partitions: per-entity ordering with room for six consumers.
+      KAFKA_NUM_PARTITIONS: 6
+      # A week of raw log: enough to rebuild the knowledge base by replay.
+      KAFKA_LOG_RETENTION_HOURS: 168
+    # 29092 is for clients on the host (scripts/kafka_smoke.py); containers use kafka:9092.
+    ports: ["29092:29092"]
     healthcheck:
-      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
-      interval: 15s
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
       timeout: 10s
-      retries: 10
-
-  worker-ingest:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.api
-    image: veritas-api:latest
-    profiles: ["kafka"]
-    command: ["python", "-m", "scripts.run_worker", "--topics", "veritas.raw,veritas.changed"]
-    environment:
-      VERITAS_KAFKA_BOOTSTRAP: kafka:9092
-      VERITAS_DATABASE_URL: postgresql://veritas:${POSTGRES_PASSWORD:-veritas_dev}@postgres:5432/veritas
-      VERITAS_DEVICE: ${VERITAS_DEVICE:-cpu}
-    volumes:
-      - ./checkpoints:/app/checkpoints:ro
-      - ./data:/app/data
-    depends_on:
-      kafka: {condition: service_healthy}
-      postgres: {condition: service_healthy}
-    # The embedding stage is the bottleneck; this is the service to scale.
-    deploy:
-      replicas: 2
-    restart: unless-stopped
+      retries: 12
+      start_period: 20s
 
   worker-poller:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.api
     image: veritas-api:latest
     profiles: ["kafka"]
     command: ["python", "-m", "scripts.run_worker", "--poll", "--interval", "900"]
     environment:
       VERITAS_KAFKA_BOOTSTRAP: kafka:9092
-    volumes: [./data:/app/data]
     depends_on:
       kafka: {condition: service_healthy}
+      api: {condition: service_started}
     restart: unless-stopped
-
-volumes:
-  pgdata:
-  kafkadata:

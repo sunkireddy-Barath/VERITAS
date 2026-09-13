@@ -58,7 +58,7 @@ pip install -r requirements.txt
 python scripts/fetch_real_data.py            # corpus + SEC facts + live feeds
 
 # 2. Verify the code is sound
-python tests/test_smoke.py                   # 10 correctness tests, ~30s
+python tests/test_smoke.py                   # 23 correctness tests, ~1 min
 
 # 3. Train from scratch, in order (notebooks 01 -> 08)
 jupyter lab notebooks/
@@ -72,7 +72,8 @@ python run_veritas.py                        # http://localhost:8000
 
 | source | what | why |
 |---|---|---|
-| **SEC EDGAR XBRL** | 1,761 facts, 20 companies | every fact carries a fiscal period **and** a filing date — genuinely bitemporal, plus 61 real restatements |
+| **SEC EDGAR XBRL** | 1,685 facts, 20 companies | every fact carries a fiscal period **and** a filing date — genuinely bitemporal, plus 60 real restatements (1,761 raw rows; when one filing reports a period under two revenue tags, the total wins) |
+| **Wikidata** | 82 dated CEO tenures, 19 companies | structured start/end qualifiers, joined to SEC by CIK — 46 real successions |
 | **Project Gutenberg** | 10.1 MB public-domain text | pretraining volume, unambiguously redistributable |
 | **SEC / WHO / ECB / NASA / arXiv** | 115 live feed items | the continuous-update path against sources that actually move |
 
@@ -189,23 +190,29 @@ testable and the whole path auditable after the fact.
 ## Deployment
 
 ```
-Browser ── Vercel (static React) ──HTTPS──▶ Fly.io / Railway (FastAPI + model)
-                                                 │
-                                 ┌───────────────┼──────────────┐
-                             Postgres          Redis          Kafka
-                        (tstzrange+pgvector)  (cache)     (optional bus)
+Browser ── Vercel (static page + config.js) ──HTTPS──▶ Fly.io (FastAPI + model + UI)
+                                                           ▲
+                                  feed poller ──▶ Kafka ───┘  (optional; the API consumes it)
 ```
 
 ```bash
-docker compose up -d                     # API + Postgres + Redis
-docker compose --profile kafka up -d     # + streaming ingestion
+python scripts/preflight.py              # blocks on the failures that broke real deploys
+make deploy-api                          # fly deploy --remote-only (image bakes the model + data)
+make deploy-web                          # Vercel; VERITAS_API_URL -> config.js at build time
+docker compose up -d --build             # local container
+make kafka && make kafka-smoke           # + Kafka broker + poller; proves a message changes an answer
 ```
 
 The backend **cannot** go on Vercel: it is a stateful process holding a model
-and indices in memory with a ~25 s startup, which is the opposite of what
-serverless is for. Frontend on Vercel, backend on a container host. Kafka is
-optional — `make_bus()` returns an in-process queue when no broker is
-configured, so the notebooks and tests run with zero infrastructure.
+and indices in memory, which is the opposite of what serverless is for.
+Frontend on Vercel, backend on a container host.
+
+Kafka is optional. When `VERITAS_KAFKA_BOOTSTRAP` is set, **the API itself
+consumes the log** in a background thread — the knowledge base lives in its
+memory, so a separate consumer would build a store no question can reach — and
+a restarted replica rebuilds by replaying it. Without a broker the tests and
+notebooks run with zero infrastructure. Postgres and Redis are not wired yet;
+`docker/initdb/01_schema.sql` is the target schema.
 
 Full guide, including the Postgres schema rationale and the two Kafka settings
 that are correctness requirements: **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**.
@@ -242,6 +249,21 @@ temporal mismatch) run first and can veto the neural entailment head.
 abstention gate is measured in both directions — correct refusals *and*
 over-refusals. A system that always refuses is not a safe system, it is a
 useless one.
+
+**6. Time travel over belief, not just over the world.**
+`GET /entity/Apple Inc./as_of?attribute=net_income&valid=2008-06-01&known=2009-12-01`
+returns **4.83B**, what the filings said then; drop `known` and it returns
+**6.12B**, the January 2010 restatement, with the full belief history. A
+same-source refiling is a `CORRECTED` event, not a "sources disagree" conflict,
+and `GET /changes` streams every succession, restatement and dispute the store
+has recorded.
+
+**7. Comparisons that respect the calendar.**
+*"Compare Apple Inc and Microsoft revenue in 2023"* answers each side as its own
+verified question, keeps each figure's own fiscal period, labels the computed
+difference as derived, and says **"the periods are not aligned"** — Apple's
+fiscal year ends in September, Microsoft's in June. If one side is unknown, it
+refuses rather than answering half the question.
 
 ---
 
@@ -307,19 +329,28 @@ docs/           RUNBOOK · architecture · algorithms · stack · INNOVATION
                 novelty · evaluation · DEPLOYMENT
 docker/         Dockerfile.api · Dockerfile.worker · initdb/01_schema.sql
 scripts/        fetch_real_data · verify_real · run_eval · run_worker
-tests/          11 correctness tests
+tests/          23 correctness tests (store, verifier, agents, loaders, API, streaming)
 ```
 
 ## Verification
 
 ```bash
-python tests/test_smoke.py       # 11/11 unit + integration
-python scripts/verify_real.py    #  7/7 against real SEC filings
+python tests/test_smoke.py       # 21/21 unit + integration + API
+python scripts/verify_real.py    # 22/22 against real SEC filings and Wikidata
+python run_veritas.py & python scripts/audit.py   # ground-truth audit (VERITAS_API=... for another port)
+python scripts/e2e_public.py https://<deployment>  # UI, SSE, auth, CORS, ingestion over the real network path
+python scripts/kafka_smoke.py                      # a Kafka message changes a live answer
 python scripts/run_eval.py       #  ablation ladder
 python scripts/run_notebook.py notebooks/*.ipynb   # all 8 execute
 ```
 
-Current results: **11/11** tests, **7/7** real-data checks, **8/8** notebooks,
+Current results: **23/23** tests, **22/22** real-data checks, **8/8** notebooks
+executed top to bottom, and `scripts/kafka_smoke.py` passing against a real
+Kafka 3.9.1 broker (a published document changes a live answer; a restarted
+API rebuilds it by replaying the log without republishing). The audit scores
+**50/50** fiscal-year answers against the filings (0 wrong, 0 refused),
+**12/12** unanswerable probes refused with **0** leaks, and **16/16** features
+verified. Earlier:
 pretraining val perplexity **36.29** (uniform 4096), abstention **5/5** correct
 refusals with **0/5** false refusals.
 

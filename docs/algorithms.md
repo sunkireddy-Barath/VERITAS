@@ -230,8 +230,22 @@ transaction time and keeps valid time. Different operations, both preserving
 history. Versions are kept sorted by `valid_from`, so as-of lookup is
 `bisect` — `O(log n)`.
 
-A restatement by a *different* source is treated as `REAFFIRMED`: it widens the
-interval and raises confidence rather than writing a duplicate row.
+Four cases for a second assertion about the same valid time:
+
+| second assertion | kind | effect |
+|---|---|---|
+| any source, **same** value | `REAFFIRMED` | widens the interval, raises confidence; no duplicate row |
+| **same** source, **different** value, filed later | `CORRECTED` | a restatement: stamps `superseded_at` on the original, keeps it |
+| **different** source, **different** value | `CONFLICT` | a dispute: both rows stay current and are surfaced |
+| any source, later `valid_from` | `CHANGED` | the world moved: closes the old valid interval |
+
+The `CORRECTED` row matters on real data. Apple filed FY2008 net income as
+4.83B in October 2009 and restated it to 6.12B in January 2010. Treating that
+as a `CONFLICT` answers "sources disagree" about a company correcting itself.
+As a correction, the present answer is 6.12B with the original named, and
+`as_of(valid=2008, known_at=2009-12-01)` still returns 4.83B. Documents backing
+only a superseded version are also withheld from claim verification, so the
+original filing cannot "refute" its own restatement.
 
 ---
 

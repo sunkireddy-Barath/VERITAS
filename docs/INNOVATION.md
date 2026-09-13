@@ -54,12 +54,12 @@ This buys four question types, not one:
 The third and fourth are impossible in any store that overwrites — and the
 fourth is the audit trail.
 
-## 3. Fifteen features, and which are genuinely differentiating
+## 3. Eighteen features, and which are genuinely differentiating
 
 | # | feature | status | who else does this |
 |---|---|---|---|
 | 1 | Bitemporal fact store (valid × transaction time) | ✅ real SEC data | temporal DBs, but not wired to RAG |
-| 2 | Restatement detection (`CORRECTED` ≠ `CHANGED`) | ✅ 61 real restatements found | **rare** |
+| 2 | Restatement detection (`CORRECTED` ≠ `CHANGED` ≠ `CONFLICT`) | ✅ same-source refilings supersede; cross-source disputes stay conflicts | **rare** |
 | 3 | `TEMPORAL_MISMATCH` verdict | ✅ | **not in standard NLI vocabularies** |
 | 4 | Stale-but-known answers with a validity qualifier | ✅ | rare; most systems answer or refuse |
 | 5 | Source independence by graph topology | ✅ | syndication detection exists, not wired to confidence |
@@ -73,6 +73,9 @@ fourth is the audit trail.
 | 13 | Domain-dependent source tiers | ✅ | usually a fixed list |
 | 14 | Synthesis from verified claims only | ✅ | inverted vs standard RAG |
 | 15 | TemporalEvidenceBench (8 categories) | ✅ | labels don't exist in NQ/FEVER/TimeQA |
+| 16 | Time travel over *belief*: `/entity/{name}/as_of?valid=&known=` | ✅ Apple FY2008: 4.83B believed in 2009, 6.12B after | SQL `AS OF SYSTEM TIME` exists; not exposed through QA |
+| 17 | Period-aware comparison (each side's own fiscal window; derived arithmetic labelled; refuses if a side is unknown) | ✅ real SEC + Wikidata | **rare**; most systems subtract misaligned periods silently |
+| 18 | World change feed (`CHANGED` / `CORRECTED` / `CONFLICT`) | ✅ `/changes` | change-data-capture exists; not as evidence events |
 
 Rows **3, 9 and 15** are where I'd put the strongest novelty claim. Rows 1, 5,
 6 and 11 exist elsewhere in isolation; the contribution is the integration.
@@ -160,7 +163,14 @@ facts):
   → "I cannot establish this from the available evidence."   ← abstains
 
 "What was Apple Inc net income in 2008?"
-  → reports the real 4.834B / 6.119B restatement, both filings cited
+  → "For fiscal year 2008 (2007-09-30 to 2008-09-27), Apple Inc's net income
+     was 6.12 billion USD. This figure was restated on 2010-01-25 by sec.gov;
+     it was originally reported as 4.83 billion USD."   ← a correction, not a dispute
+
+"Compare Apple Inc and Microsoft revenue in 2023"
+  → both figures, each with its own fiscal period, the spread labelled as
+     derived, and "The periods are not aligned" -- Apple's FY ends in September,
+     Microsoft's in June
 ```
 
 **Pretraining** (real 10.1 MB corpus, from-scratch tokenizer and transformer):

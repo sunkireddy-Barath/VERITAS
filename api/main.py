@@ -37,7 +37,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
@@ -129,7 +129,12 @@ def _boot() -> None:
     from veritas.tokenizer.bpe import BPETokenizer
 
     t0 = time.time()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # VERITAS_DEVICE pins the device (the CPU image sets "cpu"); unset = auto.
+    wanted = os.environ.get("VERITAS_DEVICE", "").strip().lower()
+    if wanted == "cuda" and not torch.cuda.is_available():
+        print("[api] VERITAS_DEVICE=cuda but no GPU is visible; using cpu")
+        wanted = "cpu"
+    device = wanted or ("cuda" if torch.cuda.is_available() else "cpu")
     tok_path = ROOT / "checkpoints" / "tokenizer.json"
     if not tok_path.exists():
         raise RuntimeError("checkpoints/tokenizer.json missing -- run notebook 01 first")
@@ -148,17 +153,85 @@ def _boot() -> None:
                                       max_seq_len=256)).to(device)
     model.eval()
 
+    data_dir = _data_dir()
     builder = VeritasSystemBuilder(model, tok, device=device, domain="corporate")
-    report = build_real_system(builder, ROOT / "data" / "real", verbose=True)
+    report = build_real_system(builder, data_dir, verbose=True)
     veritas = builder.build(config=VeritasConfig(k=8, max_iterations=3,
                                                  domain="corporate", verbose=False))
     STATE.update({
         "ready": True, "builder": builder, "veritas": veritas, "model": model,
         "tok": tok, "device": device, "boot_seconds": round(time.time() - t0, 2),
         "checkpoint": ckpt.name if ckpt.exists() else "untrained",
-        "report": report,
+        "report": report, "data_dir": str(data_dir),
     })
-    print(f"[api] ready in {STATE['boot_seconds']}s on {device} using {STATE['checkpoint']}")
+    # The broker connection runs in its own thread. Inside startup, its retries
+    # (up to two minutes while a broker boots) held uvicorn's startup hook, so
+    # the API answered nothing -- not even /health -- until Kafka was reachable.
+    STATE["bus"] = {"kind": "connecting" if os.environ.get("VERITAS_KAFKA_BOOTSTRAP", "").strip()
+                    else "none"}
+    threading.Thread(target=_start_bus, args=(builder,), name="veritas-bus-connect",
+                     daemon=True).start()
+    print(f"[api] ready in {STATE['boot_seconds']}s on {device} using {STATE['checkpoint']}, "
+          f"data={data_dir}, bus={STATE['bus']['kind']}")
+
+
+def _data_dir() -> Path:
+    """The first real-data directory that holds the SEC facts.
+
+    VERITAS_DATA_DIR, then data/real (a mount or a fresh fetch), then the seed
+    copy baked into the image. Without the fallback, an empty volume mounted
+    over data/ boots a system that knows nothing and still reports ready.
+    """
+    candidates = [os.environ.get("VERITAS_DATA_DIR", ""), ROOT / "data" / "real",
+                  ROOT / "seed" / "real"]
+    for c in candidates:
+        if c and (Path(c) / "sec_facts.jsonl").exists():
+            return Path(c)
+    raise RuntimeError("no real data found (looked for sec_facts.jsonl in "
+                       f"{[str(c) for c in candidates if c]}) -- run "
+                       "python scripts/fetch_real_data.py")
+
+
+def _start_bus(builder) -> None:
+    """With VERITAS_KAFKA_BOOTSTRAP set, consume veritas.raw in this process.
+
+    The knowledge base lives in this process's memory, so this process must be
+    the consumer: a document is only answerable once it is in THIS store. Each
+    replica consumes the whole log under its own group id, and a restart replays
+    from the earliest retained offset -- the in-memory store is rebuilt from the
+    log, which is what the log's retention is for.
+    """
+    from veritas.ingest.streaming import (TOPIC_CHANGED, TOPIC_CHANGES, TOPIC_RAW,
+                                          KafkaBus, StreamingIngest, make_bus)
+
+    bootstrap = os.environ.get("VERITAS_KAFKA_BOOTSTRAP", "").strip()
+    if not bootstrap:
+        STATE["bus"] = {"kind": "none"}
+        return
+    import socket
+    import uuid
+
+    # A NEW consumer group on every boot. Offsets are committed per group, so a
+    # fixed name ("veritas-api-<host>") resumed after the last committed offset
+    # on restart -- skipping everything already consumed, which this process's
+    # fresh in-memory store no longer holds. A group with no committed offsets
+    # reads from the earliest retained message: the restart replays the log.
+    # Set VERITAS_KAFKA_GROUP only if you want resume-from-offset instead.
+    group = os.environ.get("VERITAS_KAFKA_GROUP") or \
+        f"veritas-api-{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
+    bus = make_bus(bootstrap, group_id=group, attempts=24, wait_s=5.0)
+    if not isinstance(bus, KafkaBus):
+        # Configured but unreachable: say so on /health instead of pretending.
+        STATE["bus"] = {"kind": "unavailable", "bootstrap": bootstrap}
+        return
+    # inline: this process runs every stage itself and consumes ONLY veritas.raw.
+    # Consuming the stage topics too made a replay re-ingest the veritas.changed
+    # messages a previous run wrote AND write fresh ones from the raw replay, so
+    # every restart duplicated work and grew the log.
+    stream = StreamingIngest(builder.ingest, bus, lock=_KB_LOCK, inline=True)
+    thread, stop = stream.start_background((TOPIC_RAW,))
+    STATE["bus"] = {"kind": "kafka", "bootstrap": bootstrap, "group": group}
+    STATE.update(stream=stream, bus_thread=thread, bus_stop=stop)
 
 
 @app.on_event("startup")
@@ -233,6 +306,9 @@ def health() -> Dict[str, Any]:
         "device": STATE.get("device"),
         "checkpoint": STATE.get("checkpoint"),
         "boot_seconds": STATE.get("boot_seconds"),
+        # "none" = no broker configured; "unavailable" = configured but
+        # unreachable, which a deploy must not mistake for a working pipeline.
+        "bus": STATE.get("bus", {"kind": "starting"}),
     }
 
 
@@ -240,8 +316,11 @@ def health() -> Dict[str, Any]:
 def stats() -> Dict[str, Any]:
     _require_ready()
     b = STATE["builder"]
+    stream = STATE.get("stream")
     with _KB_LOCK:
         return {
+            "bus": dict(STATE.get("bus", {}),
+                        stats=dict(stream.stats) if stream is not None else None),
             "corpus_chunks": len(b.corpus),
             "entities": b.store.entities()[:200],
             "entity_count": len(b.store.entities()),
@@ -353,7 +432,11 @@ def as_of(name: str, attribute: str, valid: str = "", known: str = "") -> Dict[s
             "known_at": k.date().isoformat() if k else "latest",
             "value": believed.value if believed else None,
             "version": _version_json(believed) if believed else None,
-            "belief_history": [_version_json(v) for v in trail],
+            # As believed on `known`, a replacement filed later had not happened yet.
+            "belief_history": [
+                dict(_version_json(v), superseded_at=None)
+                if k is not None and v.superseded_at is not None and v.superseded_at > k
+                else _version_json(v) for v in trail],
             "note": note,
         }
 
@@ -407,16 +490,29 @@ def ingest(req: IngestRequest) -> Dict[str, Any]:
     immediately -- no re-index, no retraining."""
     _require_ready()
     b = STATE["builder"]
+    doc_id = f"api:{time.time_ns()}"
+    published = req.published or time.strftime("%Y-%m-%d")
     with _KB_LOCK:
         b.add_source(req.source_id, tier=req.tier)
-        res = b.add_document(req.source_id, f"api:{time.time_ns()}", req.text,
-                             req.published or time.strftime("%Y-%m-%d"), req.entity,
+        res = b.add_document(req.source_id, doc_id, req.text, published, req.entity,
                              url=req.url)
+    # With Kafka on, the document is also appended to veritas.raw, so a replay
+    # of the log rebuilds a store that includes it. This process's own consumer
+    # sees the same text again and change detection suppresses it, so the
+    # write-through is idempotent rather than a double ingest.
+    logged = False
+    stream = STATE.get("stream")
+    if stream is not None:
+        stream.publish_raw(source_id=req.source_id, text=req.text, doc_id=doc_id,
+                           published=published, entity=req.entity, url=req.url,
+                           tier=req.tier)
+        logged = True
     return {
         "changed": res.changed, "reason": res.reason, "chunks": res.n_chunks,
         "claims": res.n_claims, "state_changes": res.state_changes,
         "invalidated_cache_keys": res.invalidated,
         "elapsed_seconds": round(res.elapsed_s, 4), "retrain_required": False,
+        "logged_to_kafka": logged,
     }
 
 
@@ -437,6 +533,16 @@ def index():
     if not f.exists():
         raise HTTPException(404, "frontend not built")
     return FileResponse(f)
+
+
+@app.get("/config.js")
+def config_js() -> Response:
+    # The page loads config.js to learn where the API is. Served from here, the
+    # API is this same origin, so the value is empty. (On Vercel the file is
+    # generated by frontend/build-config.mjs instead.)
+    return Response('window.VERITAS_API = window.VERITAS_API || "";\n',
+                    media_type="application/javascript",
+                    headers={"Cache-Control": "no-cache"})
 
 
 if __name__ == "__main__":

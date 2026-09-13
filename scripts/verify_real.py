@@ -54,7 +54,19 @@ CASES = [
     ("Who was the CEO of Apple Inc in 2005?", "contains", "Steve Jobs"),
     ("What is Apple Inc headcount?", "abstains", None),
     ("What is Apple Inc number of unicorns?", "abstains", None),
-    ("What was Apple Inc net income in 2008?", "conflict", None),
+    # Apple filed FY2008 net income as 4.83B, then restated it to 6.12B. That is
+    # a correction by the same source, not a dispute: state the restated figure
+    # and name the original.
+    ("What was Apple Inc net income in 2008?", "contains", "6.12"),
+    ("What was Apple Inc net income in 2008?", "contains", "originally reported as 4.83"),
+    ("What was Apple Inc net income in 2008?", "excludes", "disagree"),
+    # A comparison states each side's own fiscal period and says when they differ.
+    ("Compare Apple Inc and Microsoft revenue in 2023", "contains", "383.29"),
+    ("Compare Apple Inc and Microsoft revenue in 2023", "contains", "211.91"),
+    ("Compare Apple Inc and Microsoft revenue in 2023", "contains", "not aligned"),
+    ("Compare the CEO of Apple Inc and Microsoft in 2020", "contains", "Satya Nadella"),
+    # One side unknown: refuse the comparison rather than half-answer it.
+    ("Compare Apple Inc and Zorblax Corporation revenue in 2023", "abstains", None),
 ]
 
 
@@ -81,8 +93,18 @@ def main() -> int:
         print(f"        {(a.answer or '')[:150]}")
         print(f"        support={a.support_level} abstained={a.abstained} "
               f"coverage={a.coverage:.2f} citations={len(a.citations)}\n")
-    print(f"{passed}/{len(CASES)} real-data checks passed")
-    return 0 if passed == len(CASES) else 1
+    # Transaction-time travel on a real restatement: Apple's FY2008 net income
+    # as believed before and after the January 2010 refiling.
+    total = len(CASES)
+    for known, expect in (("2009-12-01", "4.83 billion USD"), ("2010-02-01", "6.12 billion USD")):
+        v = b.store.as_of("Apple Inc.", "net_income", "2008-06-01", known_at=known)
+        ok = v is not None and v.value == expect
+        passed += ok
+        total += 1
+        print(f"{'PASS' if ok else 'FAIL'} [time-travel] Apple FY2008 net income as believed {known}")
+        print(f"        expected {expect}, got {v.value if v else None}\n")
+    print(f"{passed}/{total} real-data checks passed")
+    return 0 if passed == total else 1
 
 
 if __name__ == "__main__":

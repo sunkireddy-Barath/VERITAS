@@ -1,5 +1,6 @@
-# Ingestion worker — same image, different entrypoint. Scale this replica count
-# independently of the API: embedding is the GPU/CPU-bound stage.
+# Feed poller -- same image, different entrypoint. It publishes fetched items
+# to veritas.raw and loads no model; the API consumes the topic (the knowledge
+# base lives in the API's memory). Run exactly one replica.
 FROM veritas-api:latest
 USER veritas
-CMD ["python", "-m", "scripts.run_worker", "--topics", "veritas.raw,veritas.changed"]
+CMD ["python", "-m", "scripts.run_worker", "--poll", "--interval", "900"]

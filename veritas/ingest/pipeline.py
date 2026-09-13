@@ -161,7 +161,15 @@ class IngestionPipeline:
         last_modified: str = "",
         url: str = "",
         assert_claims: bool = True,
+        skip_change_detection: bool = False,
     ) -> IngestResult:
+        """Ingest one document.
+
+        `skip_change_detection=True` is for a caller that has ALREADY run the
+        detector on this text (the streaming pipeline's stage 2). The detector
+        records each text's fingerprint, so a second check reports
+        "identical-content" and would silently drop the document.
+        """
         t0 = time.time()
         src = self.sources.get(source_id) or Source(source_id)
         doc_id = doc_id or f"{source_id}:{now_utc().date().isoformat()}"
@@ -169,8 +177,11 @@ class IngestionPipeline:
 
         # 1-3. change cascade (cheapest filter first)
         claims = extract_claims(text, doc_id, doc_id, entity)
-        state = claims_to_state(claims)
-        report: ChangeReport = self.detector.check(source_id, text, state, etag, last_modified)
+        if skip_change_detection:
+            report = ChangeReport(True, "checked upstream")
+        else:
+            state = claims_to_state(claims)
+            report = self.detector.check(source_id, text, state, etag, last_modified)
         if not report.changed:
             return IngestResult(source_id, False, report.reason, elapsed_s=time.time() - t0)
 
@@ -182,7 +193,7 @@ class IngestionPipeline:
              "date": published or now_utc().isoformat(), "entity": entity},
             target_tokens=self.target_tokens,
         )
-        self._add_chunks(chunks, published, source_id, src.tier, entity)
+        self._add_chunks(chunks, published, source_id, src.tier, entity, url=url or src.url)
         self.graph.add_document(doc_id, source_id, date=published, url=url or src.url)
 
         # 5-9. claims -> temporal store -> graph

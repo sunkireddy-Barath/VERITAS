@@ -44,6 +44,7 @@ identical in development and the notebooks keep working unchanged.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import queue
 import threading
@@ -143,6 +144,31 @@ class LocalBus(Bus):
         return {t: q.qsize() for t, q in self.queues.items()}
 
 
+def kafka_security_config() -> Dict[str, object]:
+    """Client authentication for a managed broker, read from the environment.
+
+    Local Kafka speaks PLAINTEXT and needs none of this. Hosted clusters
+    (Confluent Cloud, Redpanda Cloud, Aiven) need SASL over TLS, so the same
+    image serves both by setting:
+
+        VERITAS_KAFKA_SECURITY_PROTOCOL=SASL_SSL
+        VERITAS_KAFKA_SASL_MECHANISM=PLAIN | SCRAM-SHA-256 | SCRAM-SHA-512
+        VERITAS_KAFKA_USERNAME=...   VERITAS_KAFKA_PASSWORD=...
+    """
+    import os
+
+    proto = os.environ.get("VERITAS_KAFKA_SECURITY_PROTOCOL", "").strip().upper()
+    if not proto or proto == "PLAINTEXT":
+        return {}
+    cfg: Dict[str, object] = {"security_protocol": proto}
+    mechanism = os.environ.get("VERITAS_KAFKA_SASL_MECHANISM", "").strip().upper()
+    if mechanism:
+        cfg.update(sasl_mechanism=mechanism,
+                   sasl_plain_username=os.environ.get("VERITAS_KAFKA_USERNAME", ""),
+                   sasl_plain_password=os.environ.get("VERITAS_KAFKA_PASSWORD", ""))
+    return cfg
+
+
 class KafkaBus(Bus):
     """kafka-python backed bus. Partitions by `key` to preserve entity order."""
 
@@ -153,9 +179,11 @@ class KafkaBus(Bus):
         self._KafkaConsumer = KafkaConsumer
         self.bootstrap = bootstrap_servers
         self.group_id = group_id
+        self.security = kafka_security_config()
         self.producer = KafkaProducer(
             bootstrap_servers=bootstrap_servers,
             client_id=client_id,
+            **self.security,
             value_serializer=lambda v: v,
             key_serializer=lambda k: k.encode("utf-8") if isinstance(k, str) else k,
             # acks="all" + idempotence: an evidence pipeline must not silently
@@ -181,6 +209,7 @@ class KafkaBus(Bus):
             enable_auto_commit=False,     # commit only after the handler succeeds
             auto_offset_reset="earliest",
             consumer_timeout_ms=1000,
+            **self.security,
         )
         self._consumer = consumer
         while not stop.is_set():
@@ -204,23 +233,37 @@ class KafkaBus(Bus):
             pass
 
 
-def make_bus(bootstrap_servers: Optional[str] = None, group_id: str = "veritas") -> Bus:
+def make_bus(bootstrap_servers: Optional[str] = None, group_id: str = "veritas",
+             attempts: int = 1, wait_s: float = 5.0) -> Bus:
     """Kafka when a broker is configured and reachable, LocalBus otherwise.
 
     Falling back rather than failing is deliberate: the notebooks, the tests and
     a laptop demo must all work with no infrastructure, while production gets
     the durable log by setting one environment variable.
+
+    `attempts` > 1 waits for a broker that is still starting. Containers start
+    together, and the API reaching Kafka a few seconds before it accepts
+    connections used to fall back to the in-process bus for its whole lifetime.
     """
     if not bootstrap_servers:
         return LocalBus()
-    try:
-        bus = KafkaBus(bootstrap_servers, group_id)
-        bus.producer.partitions_for("__veritas_probe")  # forces a metadata fetch
-        print(f"[bus] Kafka at {bootstrap_servers}")
-        return bus
-    except Exception as exc:  # noqa: BLE001
-        print(f"[bus] Kafka unavailable ({str(exc)[:80]}); using in-process bus")
-        return LocalBus()
+    last: Optional[Exception] = None
+    for attempt in range(max(1, attempts)):
+        try:
+            bus = KafkaBus(bootstrap_servers, group_id)
+            # Forces a metadata fetch against a topic the pipeline really uses
+            # (the old probe auto-created a junk "__veritas_probe" topic).
+            bus.producer.partitions_for(TOPIC_RAW)
+            print(f"[bus] Kafka at {bootstrap_servers}", flush=True)
+            return bus
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            if attempt + 1 < attempts:
+                print(f"[bus] waiting for Kafka at {bootstrap_servers} "
+                      f"({attempt + 1}/{attempts}): {str(exc)[:60]}", flush=True)
+                time.sleep(wait_s)
+    print(f"[bus] Kafka unavailable ({str(last)[:80]}); using in-process bus", flush=True)
+    return LocalBus()
 
 
 # --------------------------------------------------------------- processors
@@ -232,11 +275,28 @@ class StreamingIngest:
     without changing a line.
     """
 
-    def __init__(self, pipeline, bus: Optional[Bus] = None) -> None:
+    def __init__(self, pipeline, bus: Optional[Bus] = None, lock=None,
+                 inline: bool = False) -> None:
+        """`pipeline` may be None for a publish-only stream (the feed poller).
+
+        `lock` is held around every stage that reads or writes the knowledge
+        base. The API passes its own lock, so a consumer thread can ingest
+        beside request handlers that are iterating the same indices.
+
+        `inline=True` runs stages 2-4 in this process for each raw message and
+        publishes nothing back. It is the mode for a process that owns its own
+        knowledge base (the API): consume veritas.raw only, and a replay of the
+        log is idempotent. With stage topics, every replaying replica would
+        re-ingest the veritas.changed messages earlier runs wrote and append new
+        ones, growing the log on each restart.
+        """
         self.pipeline = pipeline
         self.bus = bus or LocalBus()
+        self.inline = inline
+        self.lock = lock if lock is not None else contextlib.nullcontext()
         self.stats: Dict[str, int] = {t: 0 for t in ALL_TOPICS}
         self.stats["suppressed"] = 0
+        self.stats["errors"] = 0
 
     # ---- stage 1: a poller publishes a fetched document --------------------
     def publish_raw(self, source_id: str, text: str, doc_id: str = "",
@@ -255,24 +315,40 @@ class StreamingIngest:
 
         claims = extract_claims(str(p["text"]), str(p.get("doc_id", "")),
                                 str(p.get("doc_id", "")), str(p.get("entity", "")))
-        report = self.pipeline.detector.check(
-            str(p["source_id"]), str(p["text"]), claims_to_state(claims))
+        with self.lock:
+            report = self.pipeline.detector.check(
+                str(p["source_id"]), str(p["text"]), claims_to_state(claims))
         if not report.changed:
             # The cheap filter doing its job: nothing downstream is woken up.
             self.stats["suppressed"] += 1
             return
-        self.bus.produce(Message(TOPIC_CHANGED, key=msg.key,
-                                 payload={**p, "change_reason": report.reason}))
+        changed = Message(TOPIC_CHANGED, key=msg.key,
+                          payload={**p, "change_reason": report.reason})
+        if self.inline:
+            self.handle_changed(changed)   # this process owns the store: no republish
+        else:
+            self.bus.produce(changed)
 
     # ---- stage 3: chunk + embed + index (GPU-bound; scale this) ------------
     def handle_changed(self, msg: Message) -> None:
         self.stats[TOPIC_CHANGED] += 1
         p = msg.payload
-        res = self.pipeline.ingest(
-            source_id=str(p["source_id"]), text=str(p["text"]),
-            doc_id=str(p.get("doc_id") or ""), published=str(p.get("published") or ""),
-            entity_hint=str(p.get("entity") or ""), url=str(p.get("url") or ""),
-        )
+        with self.lock:
+            res = self.pipeline.ingest(
+                source_id=str(p["source_id"]), text=str(p["text"]),
+                doc_id=str(p.get("doc_id") or ""), published=str(p.get("published") or ""),
+                entity_hint=str(p.get("entity") or ""), url=str(p.get("url") or ""),
+                # Stage 2 already ran change detection and RECORDED this text's
+                # fingerprint. Checking again here saw "identical-content" and
+                # dropped every message: nothing that went through the bus was
+                # ever indexed.
+                skip_change_detection=True,
+            )
+        if self.inline:
+            # A replaying replica would re-announce every past change; inline
+            # consumers expose changes through /changes instead of the topic.
+            self.stats[TOPIC_CHANGES] += len(res.state_changes)
+            return
         for change in res.state_changes:
             self.bus.produce(Message(TOPIC_CHANGES, key=msg.key,
                                      payload={"change": change,
@@ -301,7 +377,28 @@ class StreamingIngest:
 
         def dispatch(msg: Message) -> None:
             fn = handlers.get(msg.topic)
-            if fn:
+            if fn is None:
+                return
+            try:
                 fn(msg)
+            except Exception as exc:  # noqa: BLE001
+                # A malformed message must not kill a long-running consumer:
+                # LocalBus has no handler guard of its own, and in the API a dead
+                # consumer thread means ingestion silently stops.
+                self.stats["errors"] += 1
+                print(f"[bus] {msg.topic} message key={msg.key!r} failed: "
+                      f"{type(exc).__name__}: {exc}", flush=True)
 
         self.bus.consume(list(topics), dispatch, stop)
+
+    def start_background(self, topics: Sequence[str] = (TOPIC_RAW, TOPIC_CHANGED, TOPIC_CHANGES)):
+        """Run the consumer in a daemon thread. Returns (thread, stop_event).
+
+        This is how the API consumes: the knowledge base is in the API process's
+        memory, so the consumer has to run there too.
+        """
+        stop = threading.Event()
+        thread = threading.Thread(target=self.run_worker, args=(list(topics), stop),
+                                  name="veritas-bus-consumer", daemon=True)
+        thread.start()
+        return thread, stop

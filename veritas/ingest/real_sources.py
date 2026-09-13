@@ -325,6 +325,30 @@ def _human(v: float, unit: str) -> str:
     return f"{v:,.0f} {unit}"
 
 
+#: When one filing reports a period under several XBRL tags that map to the same
+#: attribute, the lower number wins. Walmart's FY2020 10-K reports Revenues
+#: (523.96B, total, including membership income) AND
+#: RevenueFromContractWithCustomerExcludingAssessedTax (519.93B, a subset). Both
+#: arrive with the same filing date, so without a priority they became a
+#: same-source CONFLICT and whichever row loaded last decided the answer.
+SEC_TAG_PRIORITY: Dict[str, int] = {
+    "Revenues": 0,
+    "RevenueFromContractWithCustomerExcludingAssessedTax": 1,
+}
+
+
+def _prefer_primary_tags(rows: List[dict]) -> List[dict]:
+    """Keep, per (entity, attribute, period, filing), only the highest-priority tag."""
+    best: Dict[tuple, int] = {}
+    for r in rows:
+        key = (r["entity"], r["attribute"], r["valid_from"], r["valid_to"], r.get("accn", ""))
+        rank = SEC_TAG_PRIORITY.get(r.get("tag", ""), 99)
+        best[key] = min(best.get(key, 99), rank)
+    return [r for r in rows
+            if SEC_TAG_PRIORITY.get(r.get("tag", ""), 99) == best[
+                (r["entity"], r["attribute"], r["valid_from"], r["valid_to"], r.get("accn", ""))]]
+
+
 def load_sec_facts(builder, path: str | Path, max_entities: int = 0,
                    verbose: bool = True) -> Dict[str, int]:
     """Load real SEC XBRL facts as genuinely bitemporal assertions.
@@ -350,6 +374,7 @@ def load_sec_facts(builder, path: str | Path, max_entities: int = 0,
             f"{path} not found. Run: python scripts/fetch_real_data.py --sec-only")
 
     rows = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    rows = _prefer_primary_tags(rows)
     rows.sort(key=lambda r: (r.get("filed") or "", r.get("valid_from") or ""))
     if max_entities:
         keep = list(dict.fromkeys(r["entity"] for r in rows))[:max_entities]

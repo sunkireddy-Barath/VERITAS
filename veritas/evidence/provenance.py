@@ -211,13 +211,16 @@ class ProvenanceBuilder:
         if self.store is not None and entity and attribute:
             hist = self.store.history(entity, attribute)
             cur = self.store.current(entity, attribute)
-            for v in hist:
+            # The timeline shows superseded originals too: a restatement should
+            # read as "reported, then restated", not as the first figure vanishing.
+            for v in self.store.history(entity, attribute, include_superseded=True):
                 ans.timeline.append(TimelineEntry(
                     value=v.value,
                     valid_from=_fmt(v.valid_from), valid_to=_fmt(v.valid_to),
                     source=v.source_id or "unknown",
                     recorded_at=_fmt(v.recorded_at), change_kind=v.change_kind,
                     is_current=bool(cur and v.version_id == cur.version_id),
+                    superseded_at=_fmt(v.superseded_at) if v.superseded_at else "",
                 ))
             for v in hist:
                 if v.change_kind == "CORRECTED":

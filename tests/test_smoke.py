@@ -155,6 +155,10 @@ def test_entity_overlap_ignores_corporate_suffixes():
 
     assert not _entity_overlap("uber technologies inc.", "apple inc")
     assert _entity_overlap("apple inc", "apple inc.")
+    assert _entity_overlap("microsoft corporation", "microsoft")
+    # an unknown company sharing words with a known one is NOT that company
+    assert not _entity_overlap("quillon robotics 6a93", "quillon robotics qwkzmpd")
+    assert not _entity_overlap("apple inc.", "apple hospitality")
 
 
 def test_person_claims_compare_names_not_years():
@@ -192,6 +196,220 @@ def test_wikitext_cleaner_keeps_list_items_and_amounts():
     assert "Tim Cook (CEO)" in people, people
     revenue = clean_wikitext(_infobox_field(box, "revenue"))
     assert "US$ 391.04 billion" in revenue, revenue
+
+
+def _sec_rows_file(rows):
+    """Write SEC-shaped rows to a temp .jsonl, so tests use the real loader."""
+    import json
+    import tempfile
+
+    f = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8")
+    with f:
+        for (entity, cik, attr, value, vf, vt, filed) in rows:
+            f.write(json.dumps({
+                "entity": entity, "cik": cik, "attribute": attr, "value": value,
+                "unit": "USD", "valid_from": vf, "valid_to": vt, "filed": filed,
+                "form": "10-K", "accn": f"{cik}-{filed}", "restatement": False}) + "\n")
+    return f.name
+
+
+def _load_sec(b, rows):
+    import os
+
+    from veritas.ingest.real_sources import load_sec_facts
+
+    path = _sec_rows_file(rows)
+    try:
+        load_sec_facts(b, path, verbose=False)
+    finally:
+        os.unlink(path)
+
+
+def test_primary_revenue_tag_wins_within_one_filing():
+    """Walmart's FY2020 10-K reports Revenues (523.96B) and the narrower
+    contract-revenue tag (519.93B) for one period. The total must win, not
+    whichever row happened to load last."""
+    import json
+    import os
+
+    from veritas.ingest.real_sources import load_sec_facts
+
+    b, _veritas, _bench = build_tiny_system()
+    path = _sec_rows_file([])
+    with open(path, "w", encoding="utf-8") as f:
+        for tag, value in (("Revenues", 523964000000),
+                           ("RevenueFromContractWithCustomerExcludingAssessedTax", 519926000000)):
+            f.write(json.dumps({
+                "entity": "Contoso Corporation", "cik": "1", "attribute": "revenue",
+                "value": value, "unit": "USD", "valid_from": "2019-02-01",
+                "valid_to": "2020-01-31", "filed": "2020-03-20", "form": "10-K",
+                "accn": "a1", "tag": tag, "restatement": False}) + "\n")
+    try:
+        load_sec_facts(b, path, verbose=False)
+    finally:
+        os.unlink(path)
+    hist = b.store.history("Contoso Corporation", "revenue")
+    assert [v.value for v in hist] == ["523.96 billion USD"], [v.value for v in hist]
+    assert not b.store.conflicts("Contoso Corporation", "revenue")
+
+
+def test_same_source_restatement_is_a_correction_not_a_conflict():
+    from veritas.temporal.versioning import ChangeKind, TemporalStore
+
+    s = TemporalStore()
+    period = dict(valid_from="2007-09-30", valid_to="2008-09-27")
+    s.assert_fact("Acme", "net_income", "4.83 billion USD", recorded_at="2009-10-27",
+                  source_id="sec.gov", **period)
+    _v, ev = s.assert_fact("Acme", "net_income", "6.12 billion USD", recorded_at="2010-01-25",
+                           source_id="sec.gov", **period)
+    assert ev.kind == ChangeKind.CORRECTED, ev.kind
+    assert s.as_of("Acme", "net_income", "2008-06-01").value == "6.12 billion USD"
+    # transaction-time travel: before the restatement was filed, and before anything was
+    assert s.as_of("Acme", "net_income", "2008-06-01",
+                   known_at="2009-12-01").value == "4.83 billion USD"
+    assert s.as_of("Acme", "net_income", "2008-06-01", known_at="2009-01-01") is None
+    assert not s.conflicts("Acme", "net_income")
+    assert [v.value for v in s.belief_history("Acme", "net_income", "2008-06-01")] == [
+        "4.83 billion USD", "6.12 billion USD"]
+    # a DIFFERENT source disputing the same period is still a conflict
+    _v, ev = s.assert_fact("Acme", "net_income", "5.00 billion USD", recorded_at="2010-02-01",
+                           source_id="reuters.com", **period)
+    assert ev.kind == ChangeKind.CONFLICT, ev.kind
+
+
+def test_comparison_names_each_side_and_flags_unaligned_periods():
+    b, veritas, _bench = build_tiny_system()
+    _load_sec(b, [
+        ("Contoso Corporation", "0000000001", "revenue", 211915000000,
+         "2022-07-01", "2023-06-30", "2023-07-27"),
+        ("Fabrikam Inc.", "0000000002", "revenue", 383285000000,
+         "2022-09-25", "2023-09-30", "2023-11-03"),
+    ])
+    ans = veritas.answer("Compare Contoso and Fabrikam revenue in 2023")
+    assert not ans.abstained, ans.answer
+    assert [r["entity"] for r in ans.comparison] == ["Contoso Corporation", "Fabrikam Inc."]
+    # 211,915,000,000 renders as 211.91 (the float sits just below .915)
+    assert "211.91 billion USD" in ans.answer and "383.29 billion USD" in ans.answer, ans.answer
+    assert "Fabrikam Inc. is higher than Contoso Corporation by 171.37" in ans.answer or \
+        "Fabrikam Inc. is higher than Contoso Corporation by 171.38" in ans.answer, ans.answer
+    assert "not reported by either source" in ans.answer, ans.answer
+    assert "not aligned" in ans.answer, ans.answer
+    markers = [c.marker for c in ans.citations]
+    assert len(markers) == len(set(markers)), markers
+    # one side unknown: refuse the comparison instead of answering half of it
+    half = veritas.answer("Compare Contoso and Zorblax Corporation revenue in 2023")
+    assert half.abstained and "Zorblax" in half.answer, half.answer
+
+
+def test_api_time_travel_change_feed_and_per_request_mode():
+    from fastapi.testclient import TestClient
+
+    import api.main as api
+
+    b, veritas, _bench = build_tiny_system()
+    _load_sec(b, [
+        ("Contoso Corporation", "0000000001", "net_income", 4834000000,
+         "2007-09-30", "2008-09-27", "2009-10-27"),
+        ("Contoso Corporation", "0000000001", "net_income", 6119000000,
+         "2007-09-30", "2008-09-27", "2010-01-25"),
+    ])
+    api.STATE.update({"ready": True, "error": None, "builder": b, "veritas": veritas})
+    try:
+        c = TestClient(api.app)   # no `with`: startup (the real boot) does not run
+        cfg = c.get("/config.js")
+        assert cfg.status_code == 200 and "window.VERITAS_API" in cfg.text, cfg.text
+        assert c.get("/health").json()["bus"]["kind"] in ("starting", "none"), c.get("/health").json()
+        path = "/entity/Contoso/as_of"
+        then = c.get(path, params={"attribute": "net_income", "valid": "2008-06-01",
+                                   "known": "2009-12-01"}).json()
+        assert then["value"] == "4.83 billion USD", then
+        now = c.get(path, params={"attribute": "net_income", "valid": "2008-06-01"}).json()
+        assert now["value"] == "6.12 billion USD" and len(now["belief_history"]) == 2, now
+        assert "revised" in now["note"], now
+        assert c.get(path, params={"attribute": "net_income", "valid": "someday"}).status_code == 422
+        assert c.get("/entity/Nobody/as_of", params={"attribute": "revenue"}).status_code == 404
+
+        feed = c.get("/changes", params={"kind": "CORRECTED"}).json()
+        assert any(x["entity"] == "Contoso Corporation" and x["new_value"] == "6.12 billion USD"
+                   for x in feed["changes"]), feed
+        tl = c.get("/entity/Contoso/timeline", params={"attribute": "net_income"}).json()
+        assert any(v["superseded_at"] for v in tl["attributes"]["net_income"]["versions"]), tl
+
+        # the request's mode applies to that request only
+        veritas.cfg.synthesis_mode = "generative"
+        a = c.post("/ask", json={"question": "What was Contoso net income in 2008?",
+                                 "mode": "extractive"}).json()
+        assert "6.12 billion USD" in a["answer"], a["answer"]
+        assert "originally reported as 4.83 billion USD" in a["answer"], a["answer"]
+        assert veritas.cfg.synthesis_mode == "generative"
+    finally:
+        api.STATE.clear()
+        api.STATE.update({"ready": False, "error": None})
+
+
+def test_bus_consumer_thread_feeds_the_answering_store():
+    """The deployed topology: a consumer thread ingests from the bus into the
+    SAME store that answers questions, and one bad message cannot kill it."""
+    import threading
+    import time
+
+    from veritas.ingest.streaming import (TOPIC_CHANGED, TOPIC_CHANGES, TOPIC_RAW,
+                                          LocalBus, Message, StreamingIngest)
+
+    b, veritas, _bench = build_tiny_system()
+    bus, lock = LocalBus(), threading.RLock()
+    # inline, consuming veritas.raw only: exactly how the API runs it
+    stream = StreamingIngest(b.ingest, bus, lock=lock, inline=True)
+    thread, stop = stream.start_background((TOPIC_RAW,))
+    try:
+        bus.produce(Message(TOPIC_RAW, key="junk", payload={}))   # malformed
+        StreamingIngest(None, bus).publish_raw(
+            source_id="sec.gov", entity="Quillon Robotics", tier=1, published="2026-09-01",
+            doc_id="quillon-8k",
+            text="Quillon Robotics filing: Ada Okafor was appointed chief executive "
+                 "officer of Quillon Robotics, effective September 2026.")
+        cur, deadline = None, time.time() + 60
+        while time.time() < deadline:
+            with lock:
+                cur = b.store.current("Quillon Robotics", "ceo")
+            if cur is not None:
+                break
+            time.sleep(0.1)
+        assert cur is not None and "Ada Okafor" in cur.value, cur
+        assert stream.stats["errors"] >= 1, stream.stats
+        assert thread.is_alive(), "a malformed message killed the consumer thread"
+        with lock:
+            ans = veritas.answer("Who is the current CEO of Quillon Robotics?")
+        assert "Ada Okafor" in ans.answer, ans.answer
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+
+
+def test_kafka_security_config_reads_managed_broker_settings():
+    import os
+
+    from veritas.ingest.streaming import kafka_security_config
+
+    keys = ("VERITAS_KAFKA_SECURITY_PROTOCOL", "VERITAS_KAFKA_SASL_MECHANISM",
+            "VERITAS_KAFKA_USERNAME", "VERITAS_KAFKA_PASSWORD")
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        assert kafka_security_config() == {}          # local PLAINTEXT broker
+        os.environ.update(VERITAS_KAFKA_SECURITY_PROTOCOL="sasl_ssl",
+                          VERITAS_KAFKA_SASL_MECHANISM="scram-sha-256",
+                          VERITAS_KAFKA_USERNAME="u", VERITAS_KAFKA_PASSWORD="p")
+        assert kafka_security_config() == {
+            "security_protocol": "SASL_SSL", "sasl_mechanism": "SCRAM-SHA-256",
+            "sasl_plain_username": "u", "sasl_plain_password": "p"}
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def test_streaming_pipeline_suppresses_unchanged():
